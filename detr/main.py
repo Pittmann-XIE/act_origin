@@ -13,8 +13,8 @@ def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float) # will be overridden
     parser.add_argument('--lr_backbone', default=1e-5, type=float) # will be overridden
-    parser.add_argument('--batch_size', default=2, type=int) # not used
-    parser.add_argument('--weight_decay', default=1e-4, type=float)
+    parser.add_argument('--batch_size', default=8, type=int) # not used
+    parser.add_argument('--weight_decay', default=5e-4, type=float)
     parser.add_argument('--epochs', default=300, type=int) # not used
     parser.add_argument('--lr_drop', default=200, type=int) # not used
     parser.add_argument('--clip_max_norm', default=0.1, type=float, # not used
@@ -94,6 +94,7 @@ def build_ACT_model_and_optimizer(args_override):
     ]
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
+    print(f'Built ACT model with lr {args.lr} and lr_backbone {args.lr_backbone}, optimizer AdamW: weight_decay {args.weight_decay}')
 
     return model, optimizer
 
@@ -118,6 +119,7 @@ def build_CNNMLP_model_and_optimizer(args_override):
     ]
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
+    print(f'Built CNNMLP model with lr {args.lr} and lr_backbone {args.lr_backbone}, optimizer AdamW: weight_decay {args.weight_decay}')
 
     return model, optimizer
 

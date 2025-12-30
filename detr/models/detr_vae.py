@@ -225,12 +225,13 @@ class DETRVAE(nn.Module):
             proprio_input = self.input_proj_robot_state(qpos)
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
-            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[-1]
+            print(f'hs shape: {hs.shape}, orignal shape: {self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight).shape}')
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
             transformer_input = torch.cat([qpos, env_state], axis=1)
-            hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
+            hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[-1]
         
         # Separate outputs for different components
         a_hat_xyz_rot = self.action_head_xyz_rot(hs)  # (batch, num_queries, 9)
