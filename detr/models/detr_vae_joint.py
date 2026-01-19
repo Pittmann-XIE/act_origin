@@ -36,13 +36,15 @@ class DETRVAE(nn.Module):
     def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names):
         super().__init__()
         self.num_queries = num_queries
+        print(f'deter_vae_joint/num_queries: {self.num_queries}')
         self.camera_names = camera_names
+        print(f'deter_vae_joint/camera_names: {self.camera_names}')
         self.transformer = transformer
         self.encoder = encoder
         hidden_dim = transformer.d_model
         
         # Separate heads for different action components
-        self.action_head_xyz_rot = nn.Linear(hidden_dim, 9)  # tx, ty, tz, 6D rotation (no activation)
+        self.action_head_joint = nn.Linear(hidden_dim, 6)  # j0,j1,j2,j3,j4,j5
         self.action_head_distance = nn.Linear(hidden_dim, 1)  # distance_class (will apply sigmoid)
         
         self.is_pad_head = nn.Linear(hidden_dim, 1)
@@ -51,9 +53,9 @@ class DETRVAE(nn.Module):
         if backbones is not None:
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
             self.backbones = nn.ModuleList(backbones)
-            self.input_proj_robot_state = nn.Linear(10, hidden_dim)
+            self.input_proj_robot_state = nn.Linear(7, hidden_dim)
         else:
-            self.input_proj_robot_state = nn.Linear(10, hidden_dim)
+            self.input_proj_robot_state = nn.Linear(7, hidden_dim)
             self.input_proj_env_state = nn.Linear(7, hidden_dim)
             self.pos = torch.nn.Embedding(2, hidden_dim)
             self.backbones = None
@@ -61,8 +63,8 @@ class DETRVAE(nn.Module):
         # encoder extra parameters
         self.latent_dim = 32
         self.cls_embed = nn.Embedding(1, hidden_dim)
-        self.encoder_action_proj = nn.Linear(10, hidden_dim)
-        self.encoder_joint_proj = nn.Linear(10, hidden_dim)
+        self.encoder_action_proj = nn.Linear(7, hidden_dim)
+        self.encoder_joint_proj = nn.Linear(7, hidden_dim)
         self.latent_proj = nn.Linear(hidden_dim, self.latent_dim*2)
         self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim))
 
@@ -126,12 +128,12 @@ class DETRVAE(nn.Module):
             hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[-1]
         
         # Separate outputs for different components
-        a_hat_xyz_rot = self.action_head_xyz_rot(hs)  # (batch, num_queries, 9)
+        a_hat_joint = self.action_head_joint(hs)  # (batch, num_queries, 6)
         a_hat_distance = torch.sigmoid(self.action_head_distance(hs))  # (batch, num_queries, 1) with sigmoid
         print('a_hat_xyz_rot')
         
         # Concatenate all components
-        a_hat = torch.cat([a_hat_xyz_rot, a_hat_distance], dim=-1)  # (batch, num_queries, 10)
+        a_hat = torch.cat([a_hat_joint, a_hat_distance], dim=-1)  # (batch, num_queries, 7)
         
         is_pad_hat = self.is_pad_head(hs)
         return a_hat, is_pad_hat, [mu, logvar]
@@ -224,13 +226,13 @@ def build_encoder(args):
 
 
 def build(args):
-    state_dim = 10 # TODO hardcode
+    state_dim = 7 # TODO hardcode
 
     # From state
     # backbone = None # from state for now, no need for conv nets
     # From image
     backbones = []
-    print('detr_vae: building backbone')
+    print('detr_vae_joint: building backbone for state_dim=7')
     backbone = build_backbone(args)
     backbones.append(backbone)
 
