@@ -53,13 +53,24 @@ class DETRVAE(nn.Module):
         if backbones is not None:
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
             self.backbones = nn.ModuleList(backbones)
+            #===changed for keypoint===
+            self.num_keypoints = 32 # You can adjust this (16, 32, 64)
+            # Reduce 512 channels to 32 keypoint heatmaps
+            self.keypoint_proj = nn.Conv2d(backbones[0].num_channels, self.num_keypoints, kernel_size=1)
+            # Based on 480x640 input, ResNet output is 15x20
+            self.spatial_softmax = SpatialSoftmax(h=15, w=20)
+            # Project the (x,y) keypoints into the transformer hidden_dim
+            self.keypoint_to_embed = nn.Linear(2, hidden_dim)
+            # == end changed for keypoint ===
             self.input_proj_robot_state = nn.Linear(7, hidden_dim)
+            print('backbones not none')
         else:
             self.input_proj_robot_state = nn.Linear(7, hidden_dim)
             self.input_proj_env_state = nn.Linear(7, hidden_dim)
             self.pos = torch.nn.Embedding(2, hidden_dim)
             self.backbones = None
-
+            print('backbones is none')
+    
         # encoder extra parameters
         self.latent_dim = 32
         self.cls_embed = nn.Embedding(1, hidden_dim)
@@ -110,17 +121,74 @@ class DETRVAE(nn.Module):
         if self.backbones is not None:
             all_cam_features = []
             all_cam_pos = []
+            
+            # 1. Decide which cameras to drop for this batch (Training only)
+            dropped_indices = []
+            if self.training:
+                for i in range(len(self.camera_names)):
+                    if torch.rand(1) < 0.25: # 25% chance per camera
+                        dropped_indices.append(i)
+                
+                # Safety check: If we accidentally dropped ALL cameras, 
+                # keep one random one so the model isn't blind.
+                if len(dropped_indices) == len(self.camera_names):
+                    keep_idx = torch.randint(0, len(self.camera_names), (1,)).item()
+                    dropped_indices.remove(keep_idx)
+
+            # # 2. Process backbones
+            # for cam_id, cam_name in enumerate(self.camera_names):
+            #     features, pos = self.backbones[cam_id](image[:, cam_id])
+            #     features = features[0]
+            #     pos = pos[0]
+            #     proj_feat = self.input_proj(features)
+                
+            #     # Apply the drop
+            #     if cam_id in dropped_indices:
+            #         proj_feat = torch.zeros_like(proj_feat)
+                
+            #     all_cam_features.append(proj_feat)
+            #     all_cam_pos.append(pos)
+                
+            # proprio_input = self.input_proj_robot_state(qpos)
+            # src = torch.cat(all_cam_features, axis=3)
+            # pos = torch.cat(all_cam_pos, axis=3)
+            # hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[-1]
+            #===changed for keypoint===
             for cam_id, cam_name in enumerate(self.camera_names):
-                features, pos = self.backbones[0](image[:, cam_id])
-                features = features[0]
-                pos = pos[0]
-                all_cam_features.append(self.input_proj(features))
-                all_cam_pos.append(pos)
+                features, pos = self.backbones[cam_id](image[:, cam_id])
+                features = features[0] # [B, 512, 15, 20]
+                
+                # --- SPATIAL SOFTMAX BOTTLENECK ---
+                # 1. Get heatmaps
+                heatmaps = self.keypoint_proj(features) # [B, 32, 15, 20]
+                
+                # 2. Apply dropout to vision here (zeroing heatmaps)
+                if self.training and cam_id in dropped_indices:
+                    heatmaps = torch.zeros_like(heatmaps)
+                
+                # 3. Get [x, y] coordinates
+                keypoints = self.spatial_softmax(heatmaps) # [B, 32, 2]
+                
+                # 4. Convert keypoints to transformer tokens
+                # [B, 32, hidden_dim]
+                cam_feat_tokens = self.keypoint_to_embed(keypoints)
+                # ----------------------------------
+                
+                all_cam_features.append(cam_feat_tokens)
+                
+            # Combine all cameras
+            # Since tokens are already [B, N, C], we cat on the sequence dimension (1)
+            src = torch.cat(all_cam_features, axis=1) # [B, num_cam * 32, hidden_dim]
+            
+            # Since keypoints carry their own spatial info, 
+            # we can pass None or a zeroed pos to the transformer
+            pos = torch.zeros_like(src) 
+            
             proprio_input = self.input_proj_robot_state(qpos)
-            src = torch.cat(all_cam_features, axis=3)
-            pos = torch.cat(all_cam_pos, axis=3)
+            
+            # Note: You might need to adjust transformer.py slightly 
+            # because 'src' is now 3D [B, Seq, Dim] instead of 4D [B, C, H, W]
             hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[-1]
-            print(f'hs shape: {hs.shape}, orignal shape: {self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight).shape}')
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
@@ -130,7 +198,6 @@ class DETRVAE(nn.Module):
         # Separate outputs for different components
         a_hat_joint = self.action_head_joint(hs)  # (batch, num_queries, 6)
         a_hat_distance = torch.sigmoid(self.action_head_distance(hs))  # (batch, num_queries, 1) with sigmoid
-        print('a_hat_xyz_rot')
         
         # Concatenate all components
         a_hat = torch.cat([a_hat_joint, a_hat_distance], dim=-1)  # (batch, num_queries, 7)
@@ -196,6 +263,40 @@ class CNNMLP(nn.Module):
         return a_hat
 
 
+class SpatialSoftmax(nn.Module):
+    def __init__(self, h, w, temperature=1.0):
+        super().__init__()
+        self.h = h
+        self.w = w
+        self.temperature = temperature
+
+        # Create a grid of coordinates [-1, 1]
+        pos_x, pos_y = torch.meshgrid(
+            torch.linspace(-1, 1, w),
+            torch.linspace(-1, 1, h),
+            indexing='ij'
+        )
+        # Shape: [2, H, W] -> [1, 2, H, W]
+        grid = torch.stack([pos_x.T, pos_y.T], dim=0).unsqueeze(0)
+        self.register_buffer('grid', grid)
+
+    def forward(self, x):
+        # x: [batch, channels, h, w]
+        batch, c, h, w = x.shape
+        
+        # 1. Flatten spatial dims and apply Softmax
+        # [batch, channels, h*w]
+        softmax_attention = torch.nn.functional.softmax(x.view(batch, c, -1) / self.temperature, dim=-1)
+        softmax_attention = softmax_attention.view(batch, c, h, w)
+
+        # 2. Compute expected value of coordinates
+        # [batch, channels, 2, h, w] * [1, 1, 2, h, w]
+        expected_pos = torch.sum(softmax_attention.unsqueeze(2) * self.grid, dim=[3, 4])
+        # Output: [batch, channels, 2]
+        return expected_pos
+
+
+
 def mlp(input_dim, hidden_dim, output_dim, hidden_depth):
     if hidden_depth == 0:
         mods = [nn.Linear(input_dim, output_dim)]
@@ -233,8 +334,9 @@ def build(args):
     # From image
     backbones = []
     print('detr_vae_joint: building backbone for state_dim=7')
-    backbone = build_backbone(args)
-    backbones.append(backbone)
+    for _ in args.camera_names:
+        backbone = build_backbone(args)
+        backbones.append(backbone)
 
     transformer = build_transformer(args)
 

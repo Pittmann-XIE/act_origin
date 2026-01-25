@@ -61,13 +61,27 @@ class Transformer(nn.Module):
 
             addition_input = torch.stack([latent_input, proprio_input], axis=0)
             src = torch.cat([addition_input, src], axis=0)
+        # else:
+        #     assert len(src.shape) == 3
+        #     # flatten NxHWxC to HWxNxC
+        #     bs, hw, c = src.shape
+        #     src = src.permute(1, 0, 2)
+        #     pos_embed = pos_embed.unsqueeze(1).repeat(1, bs, 1)
+        #     query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
         else:
-            assert len(src.shape) == 3
-            # flatten NxHWxC to HWxNxC
-            bs, hw, c = src.shape
-            src = src.permute(1, 0, 2)
-            pos_embed = pos_embed.unsqueeze(1).repeat(1, bs, 1)
+            # This is where your Spatial Softmax tokens will go
+            bs, seq_len, c = src.shape
+            src = src.permute(1, 0, 2) # [Seq, B, Dim]
+            # Handle Pos Embed
+            pos_embed = pos_embed.permute(1, 0, 2) # [Seq, B, Dim]
+            # Prepare Query and Latent/Proprio
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+            # Cat latent and proprio onto the front of the sequence
+            # additional_pos_embed is usually size 2 (for latent and proprio)
+            add_pos = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1)
+            pos_embed = torch.cat([add_pos, pos_embed], axis=0)
+            extra_input = torch.stack([latent_input, proprio_input], axis=0)
+            src = torch.cat([extra_input, src], axis=0)
 
         tgt = torch.zeros_like(query_embed)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)

@@ -128,7 +128,6 @@ class DETRVAE(nn.Module):
         # Separate outputs for different components
         a_hat_xyz_rot = self.action_head_xyz_rot(hs)  # (batch, num_queries, 9)
         a_hat_distance = torch.sigmoid(self.action_head_distance(hs))  # (batch, num_queries, 1) with sigmoid
-        print('a_hat_xyz_rot')
         
         # Concatenate all components
         a_hat = torch.cat([a_hat_xyz_rot, a_hat_distance], dim=-1)  # (batch, num_queries, 10)
