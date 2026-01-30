@@ -13,6 +13,10 @@ import numpy as np
 import IPython
 e = IPython.embed
 
+import os
+import cv2
+import torchvision.transforms as T
+
 
 def reparametrize(mu, logvar):
     std = logvar.div(2).exp()
@@ -54,11 +58,11 @@ class DETRVAE(nn.Module):
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
             self.backbones = nn.ModuleList(backbones)
             #===changed for keypoint===
-            self.num_keypoints = 32 # You can adjust this (16, 32, 64)
+            self.num_keypoints = 64 # You can adjust this (16, 32, 64)
             # Reduce 512 channels to 32 keypoint heatmaps
             self.keypoint_proj = nn.Conv2d(backbones[0].num_channels, self.num_keypoints, kernel_size=1)
             # Based on 480x640 input, ResNet output is 15x20
-            self.spatial_softmax = SpatialSoftmax(h=15, w=20)
+            self.spatial_softmax = SpatialSoftmax(h=15, w=20, temperature=0.1)
             # Project the (x,y) keypoints into the transformer hidden_dim
             self.keypoint_to_embed = nn.Linear(2, hidden_dim)
             # == end changed for keypoint ===
@@ -83,128 +87,242 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim)
         self.additional_pos_embed = nn.Embedding(2, hidden_dim)
 
+    # def forward(self, qpos, image, env_state, actions=None, is_pad=None):
+    #     """
+    #     qpos: batch, qpos_dim
+    #     image: batch, num_cam, channel, height, width
+    #     env_state: None
+    #     actions: batch, seq, action_dim
+    #     """
+    #     is_training = actions is not None
+    #     bs, _ = qpos.shape
+        
+    #     ### Obtain latent z from action sequence
+    #     if is_training:
+    #         action_embed = self.encoder_action_proj(actions)
+    #         qpos_embed = self.encoder_joint_proj(qpos)
+    #         qpos_embed = torch.unsqueeze(qpos_embed, axis=1)
+    #         cls_embed = self.cls_embed.weight
+    #         cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1)
+    #         encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], axis=1)
+    #         encoder_input = encoder_input.permute(1, 0, 2)
+    #         cls_joint_is_pad = torch.full((bs, 2), False).to(qpos.device)
+    #         is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)
+    #         pos_embed = self.pos_table.clone().detach()
+    #         pos_embed = pos_embed.permute(1, 0, 2)
+    #         encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
+    #         encoder_output = encoder_output[0]
+    #         latent_info = self.latent_proj(encoder_output)
+    #         mu = latent_info[:, :self.latent_dim]
+    #         logvar = latent_info[:, self.latent_dim:]
+    #         latent_sample = reparametrize(mu, logvar)
+    #         latent_input = self.latent_out_proj(latent_sample) 
+    #     else:
+    #         mu = logvar = None
+    #         latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
+    #         latent_input = self.latent_out_proj(latent_sample)
+
+    #     if self.backbones is not None:
+    #         all_cam_features = []
+    #         all_cam_pos = []
+            
+    #         # 1. Decide which cameras to drop for this batch (Training only)
+    #         dropped_indices = []
+    #         if self.training:
+    #             for i in range(len(self.camera_names)):
+    #                 if torch.rand(1) < 0.25: # 25% chance per camera
+    #                     dropped_indices.append(i)
+                
+    #             # Safety check: If we accidentally dropped ALL cameras, 
+    #             # keep one random one so the model isn't blind.
+    #             if len(dropped_indices) == len(self.camera_names):
+    #                 keep_idx = torch.randint(0, len(self.camera_names), (1,)).item()
+    #                 dropped_indices.remove(keep_idx)
+
+    #         # # 2. Process backbones
+    #         # for cam_id, cam_name in enumerate(self.camera_names):
+    #         #     features, pos = self.backbones[cam_id](image[:, cam_id])
+    #         #     features = features[0]
+    #         #     pos = pos[0]
+    #         #     proj_feat = self.input_proj(features)
+                
+    #         #     # Apply the drop
+    #         #     if cam_id in dropped_indices:
+    #         #         proj_feat = torch.zeros_like(proj_feat)
+                
+    #         #     all_cam_features.append(proj_feat)
+    #         #     all_cam_pos.append(pos)
+                
+    #         # proprio_input = self.input_proj_robot_state(qpos)
+    #         # src = torch.cat(all_cam_features, axis=3)
+    #         # pos = torch.cat(all_cam_pos, axis=3)
+    #         # hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[-1]
+    #         #===changed for keypoint===
+    #         for cam_id, cam_name in enumerate(self.camera_names):
+    #             features, pos = self.backbones[cam_id](image[:, cam_id])
+    #             features = features[0] # [B, 512, 15, 20]
+                
+    #             # --- SPATIAL SOFTMAX BOTTLENECK ---
+    #             # 1. Get heatmaps
+    #             heatmaps = self.keypoint_proj(features) # [B, 32, 15, 20]
+                
+    #             # 2. Apply dropout to vision here (zeroing heatmaps)
+    #             if self.training and cam_id in dropped_indices:
+    #                 heatmaps = torch.zeros_like(heatmaps)
+                
+    #             # 3. Get [x, y] coordinates
+    #             keypoints = self.spatial_softmax(heatmaps) # [B, 32, 2]
+                
+    #             if not self.training:
+    #                 # If this value is near 0, all 32 dots are stuck in the same place!
+    #                 print(f"Keypoint Variance: {keypoints.var(dim=0).mean().item():.6f}")
+                
+    #             # 4. Convert keypoints to transformer tokens
+    #             # [B, 32, hidden_dim]
+    #             cam_feat_tokens = self.keypoint_to_embed(keypoints)
+    #             # ----------------------------------
+                
+    #             all_cam_features.append(cam_feat_tokens)
+                
+    #         # Combine all cameras
+    #         # Since tokens are already [B, N, C], we cat on the sequence dimension (1)
+    #         src = torch.cat(all_cam_features, axis=1) # [B, num_cam * 32, hidden_dim]
+            
+    #         # Since keypoints carry their own spatial info, 
+    #         # we can pass None or a zeroed pos to the transformer
+    #         pos = torch.zeros_like(src) 
+            
+    #         proprio_input = self.input_proj_robot_state(qpos)
+            
+    #         # Note: You might need to adjust transformer.py slightly 
+    #         # because 'src' is now 3D [B, Seq, Dim] instead of 4D [B, C, H, W]
+    #         hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[-1]
+    #     else:
+    #         qpos = self.input_proj_robot_state(qpos)
+    #         env_state = self.input_proj_env_state(env_state)
+    #         transformer_input = torch.cat([qpos, env_state], axis=1)
+    #         hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[-1]
+        
+    #     # Separate outputs for different components
+    #     a_hat_joint = self.action_head_joint(hs)  # (batch, num_queries, 6)
+    #     a_hat_distance = torch.sigmoid(self.action_head_distance(hs))  # (batch, num_queries, 1) with sigmoid
+        
+    #     # Concatenate all components
+    #     a_hat = torch.cat([a_hat_joint, a_hat_distance], dim=-1)  # (batch, num_queries, 7)
+        
+    #     is_pad_hat = self.is_pad_head(hs)
+    #     return a_hat, is_pad_hat, [mu, logvar]
+
     def forward(self, qpos, image, env_state, actions=None, is_pad=None):
-        """
-        qpos: batch, qpos_dim
-        image: batch, num_cam, channel, height, width
-        env_state: None
-        actions: batch, seq, action_dim
-        """
-        is_training = actions is not None
-        bs, _ = qpos.shape
-        
-        ### Obtain latent z from action sequence
-        if is_training:
-            action_embed = self.encoder_action_proj(actions)
-            qpos_embed = self.encoder_joint_proj(qpos)
-            qpos_embed = torch.unsqueeze(qpos_embed, axis=1)
-            cls_embed = self.cls_embed.weight
-            cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1)
-            encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], axis=1)
-            encoder_input = encoder_input.permute(1, 0, 2)
-            cls_joint_is_pad = torch.full((bs, 2), False).to(qpos.device)
-            is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)
-            pos_embed = self.pos_table.clone().detach()
-            pos_embed = pos_embed.permute(1, 0, 2)
-            encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
-            encoder_output = encoder_output[0]
-            latent_info = self.latent_proj(encoder_output)
-            mu = latent_info[:, :self.latent_dim]
-            logvar = latent_info[:, self.latent_dim:]
-            latent_sample = reparametrize(mu, logvar)
-            latent_input = self.latent_out_proj(latent_sample) 
-        else:
-            mu = logvar = None
-            latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
-            latent_input = self.latent_out_proj(latent_sample)
+            is_training = actions is not None
+            bs, _ = qpos.shape
+            
+            ### Obtain latent z logic (unchanged) ...
+            if is_training:
+                action_embed = self.encoder_action_proj(actions)
+                qpos_embed = self.encoder_joint_proj(qpos)
+                qpos_embed = torch.unsqueeze(qpos_embed, axis=1)
+                cls_embed = self.cls_embed.weight
+                cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1)
+                encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], axis=1)
+                encoder_input = encoder_input.permute(1, 0, 2)
+                cls_joint_is_pad = torch.full((bs, 2), False).to(qpos.device)
+                is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)
+                pos_embed = self.pos_table.clone().detach()
+                pos_embed = pos_embed.permute(1, 0, 2)
+                encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
+                encoder_output = encoder_output[0]
+                latent_info = self.latent_proj(encoder_output)
+                mu = latent_info[:, :self.latent_dim]
+                logvar = latent_info[:, self.latent_dim:]
+                latent_sample = reparametrize(mu, logvar)
+                latent_input = self.latent_out_proj(latent_sample) 
+                if torch.rand(1) < 0.25: 
+                    latent_input = torch.zeros_like(latent_input)
+            else:
+                mu = logvar = None
+                latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
+                latent_input = self.latent_out_proj(latent_sample)
 
-        if self.backbones is not None:
-            all_cam_features = []
-            all_cam_pos = []
-            
-            # 1. Decide which cameras to drop for this batch (Training only)
-            dropped_indices = []
-            if self.training:
-                for i in range(len(self.camera_names)):
-                    if torch.rand(1) < 0.25: # 25% chance per camera
-                        dropped_indices.append(i)
+            if self.backbones is not None:
+                all_cam_features = []
                 
-                # Safety check: If we accidentally dropped ALL cameras, 
-                # keep one random one so the model isn't blind.
-                if len(dropped_indices) == len(self.camera_names):
-                    keep_idx = torch.randint(0, len(self.camera_names), (1,)).item()
-                    dropped_indices.remove(keep_idx)
+                # 1. Camera Drop Logic (unchanged)
+                dropped_indices = []
+                if self.training:
+                    for i in range(len(self.camera_names)):
+                        if torch.rand(1) < 0.25: dropped_indices.append(i)
+                    if len(dropped_indices) == len(self.camera_names):
+                        dropped_indices.remove(torch.randint(0, len(self.camera_names), (1,)).item())
 
-            # # 2. Process backbones
-            # for cam_id, cam_name in enumerate(self.camera_names):
-            #     features, pos = self.backbones[cam_id](image[:, cam_id])
-            #     features = features[0]
-            #     pos = pos[0]
-            #     proj_feat = self.input_proj(features)
-                
-            #     # Apply the drop
-            #     if cam_id in dropped_indices:
-            #         proj_feat = torch.zeros_like(proj_feat)
-                
-            #     all_cam_features.append(proj_feat)
-            #     all_cam_pos.append(pos)
-                
-            # proprio_input = self.input_proj_robot_state(qpos)
-            # src = torch.cat(all_cam_features, axis=3)
-            # pos = torch.cat(all_cam_pos, axis=3)
-            # hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[-1]
-            #===changed for keypoint===
-            for cam_id, cam_name in enumerate(self.camera_names):
-                features, pos = self.backbones[cam_id](image[:, cam_id])
-                features = features[0] # [B, 512, 15, 20]
-                
-                # --- SPATIAL SOFTMAX BOTTLENECK ---
-                # 1. Get heatmaps
-                heatmaps = self.keypoint_proj(features) # [B, 32, 15, 20]
-                
-                # 2. Apply dropout to vision here (zeroing heatmaps)
-                if self.training and cam_id in dropped_indices:
-                    heatmaps = torch.zeros_like(heatmaps)
-                
-                # 3. Get [x, y] coordinates
-                keypoints = self.spatial_softmax(heatmaps) # [B, 32, 2]
-                
-                # 4. Convert keypoints to transformer tokens
-                # [B, 32, hidden_dim]
-                cam_feat_tokens = self.keypoint_to_embed(keypoints)
-                # ----------------------------------
-                
-                all_cam_features.append(cam_feat_tokens)
-                
-            # Combine all cameras
-            # Since tokens are already [B, N, C], we cat on the sequence dimension (1)
-            src = torch.cat(all_cam_features, axis=1) # [B, num_cam * 32, hidden_dim]
+                # 2. Process backbones + Spatial Softmax
+                for cam_id, cam_name in enumerate(self.camera_names):
+                    features, _ = self.backbones[cam_id](image[:, cam_id])
+                    features = features[0] # [B, 512, 15, 20]
+                    
+                    heatmaps = self.keypoint_proj(features) # [B, 32, 15, 20]
+                    if self.training and cam_id in dropped_indices:
+                        heatmaps = torch.zeros_like(heatmaps)
+                    
+                    keypoints = self.spatial_softmax(heatmaps) # [B, 32, 2]
+                    
+                    # --- DIAGNOSTICS ---
+                    if not self.training:
+                        # 1. Check Variance: How much do the dots move across the batch?
+                        # High variance = dots are tracking different things in different images.
+                        # Low variance = dots are all stuck in the same pixels.
+                        var = keypoints.var(dim=0).mean().item()
+                        if var < 1e-5:
+                            print(f"WARNING: Cam {cam_name} keypoint variance is VERY low ({var:.8f}). Backbone might be dead.")
+                        
+                        # 2. Plotting: Save one image per batch during eval
+                        # We save the first image of the batch (index 0)
+                        save_path = f"eval/debug_keypoints_{cam_name}.png"
+                        self._save_debug_image(image[0, cam_id], keypoints[0], save_path)
+                    # -------------------
+                    
+                    cam_feat_tokens = self.keypoint_to_embed(keypoints)
+                    all_cam_features.append(cam_feat_tokens)
+                    
+                src = torch.cat(all_cam_features, axis=1) 
+                pos = torch.zeros_like(src) 
+                proprio_input = self.input_proj_robot_state(qpos)
+                hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[-1]
+            else:
+                qpos = self.input_proj_robot_state(qpos)
+                env_state = self.input_proj_env_state(env_state)
+                transformer_input = torch.cat([qpos, env_state], axis=1)
+                hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[-1]
             
-            # Since keypoints carry their own spatial info, 
-            # we can pass None or a zeroed pos to the transformer
-            pos = torch.zeros_like(src) 
-            
-            proprio_input = self.input_proj_robot_state(qpos)
-            
-            # Note: You might need to adjust transformer.py slightly 
-            # because 'src' is now 3D [B, Seq, Dim] instead of 4D [B, C, H, W]
-            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[-1]
-        else:
-            qpos = self.input_proj_robot_state(qpos)
-            env_state = self.input_proj_env_state(env_state)
-            transformer_input = torch.cat([qpos, env_state], axis=1)
-            hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[-1]
-        
-        # Separate outputs for different components
-        a_hat_joint = self.action_head_joint(hs)  # (batch, num_queries, 6)
-        a_hat_distance = torch.sigmoid(self.action_head_distance(hs))  # (batch, num_queries, 1) with sigmoid
-        
-        # Concatenate all components
-        a_hat = torch.cat([a_hat_joint, a_hat_distance], dim=-1)  # (batch, num_queries, 7)
-        
-        is_pad_hat = self.is_pad_head(hs)
-        return a_hat, is_pad_hat, [mu, logvar]
+            a_hat_joint = self.action_head_joint(hs)
+            a_hat_distance = torch.sigmoid(self.action_head_distance(hs))
+            a_hat = torch.cat([a_hat_joint, a_hat_distance], dim=-1)
+            is_pad_hat = self.is_pad_head(hs)
+            return a_hat, is_pad_hat, [mu, logvar]
 
+    def _save_debug_image(self, img_tensor, kpts, path):
+        """Helper to denormalize image, draw keypoints, and save."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        # 1. Denormalize
+        inv_normalize = T.Normalize(
+            mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
+            std=[1/0.229, 1/0.224, 1/0.225]
+        )
+        img = inv_normalize(img_tensor).permute(1, 2, 0).cpu().numpy()
+        img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        h, w, _ = img.shape
+        # 2. Draw 32 keypoints
+        for i in range(kpts.shape[0]):
+            # Spatial softmax outputs -1 to 1. Convert to 0 to pixels.
+            x = int((kpts[i, 0].item() + 1) / 2 * w)
+            y = int((kpts[i, 1].item() + 1) / 2 * h)
+            cv2.circle(img, (x, y), 4, (0, 255, 0), -1)
+            cv2.putText(img, str(i), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        cv2.imwrite(path, img)
 
 class CNNMLP(nn.Module):
     def __init__(self, backbones, state_dim, camera_names):
@@ -264,7 +382,7 @@ class CNNMLP(nn.Module):
 
 
 class SpatialSoftmax(nn.Module):
-    def __init__(self, h, w, temperature=1.0):
+    def __init__(self, h, w, temperature=0.1):
         super().__init__()
         self.h = h
         self.w = w
