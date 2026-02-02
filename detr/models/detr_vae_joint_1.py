@@ -44,7 +44,7 @@ class DETRVAE(nn.Module):
         hidden_dim = transformer.d_model
         
         # Separate heads for different action components
-        self.action_head_joint = nn.Linear(hidden_dim, 7)  # j0,j1,j2,j3,j4,j5
+        self.action_head_joint = nn.Linear(hidden_dim, state_dim)  # j0,j1,j2,j3,j4,j5
         
         self.is_pad_head = nn.Linear(hidden_dim, 1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
@@ -52,18 +52,18 @@ class DETRVAE(nn.Module):
         if backbones is not None:
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
             self.backbones = nn.ModuleList(backbones)
-            self.input_proj_robot_state = nn.Linear(7, hidden_dim)
+            self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
         else:
-            self.input_proj_robot_state = nn.Linear(7, hidden_dim)
-            self.input_proj_env_state = nn.Linear(7, hidden_dim)
+            self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
+            self.input_proj_env_state = nn.Linear(state_dim, hidden_dim)
             self.pos = torch.nn.Embedding(2, hidden_dim)
             self.backbones = None
 
         # encoder extra parameters
         self.latent_dim = 32
         self.cls_embed = nn.Embedding(1, hidden_dim)
-        self.encoder_action_proj = nn.Linear(7, hidden_dim)
-        self.encoder_joint_proj = nn.Linear(7, hidden_dim)
+        self.encoder_action_proj = nn.Linear(state_dim, hidden_dim)
+        self.encoder_joint_proj = nn.Linear(state_dim, hidden_dim)
         self.latent_proj = nn.Linear(hidden_dim, self.latent_dim*2)
         self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim))
 
@@ -100,7 +100,7 @@ class DETRVAE(nn.Module):
             mu = latent_info[:, :self.latent_dim]
             logvar = latent_info[:, self.latent_dim:]
             latent_sample = reparametrize(mu, logvar)
-            latent_input = self.latent_out_proj(latent_sample) 
+            latent_input = self.latent_out_proj(latent_sample)
         else:
             mu = logvar = None
             latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
@@ -218,13 +218,14 @@ def build_encoder(args):
 
 
 def build(args):
-    state_dim = 7 # TODO hardcode
+    state_dim = args.state_dim # TODO hardcode
+    print(f'state dim {state_dim}')
 
     # From state
     # backbone = None # from state for now, no need for conv nets
     # From image
     backbones = []
-    print('detr_vae_joint: building backbone for state_dim=7')
+    # print('detr_vae_joint: building backbone for state_dim=')
     for _ in args.camera_names:
         backbone = build_backbone(args)
         backbones.append(backbone)
