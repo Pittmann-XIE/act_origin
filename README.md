@@ -72,10 +72,10 @@ To train ACT:
     # Transfer Cube task
     python3 imitate_episodes.py \
     --task_name sim_transfer_cube_scripted \
-    --ckpt_dir <ckpt dir> \
-    --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
-    --num_epochs 2000  --lr 1e-5 \
-    --seed 0
+    --ckpt_dir checkpoints_aux\
+    --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 16 --dim_feedforward 3200 \
+    --num_epochs 4000  --lr 2e-5 \
+    --seed 10 > train_aux.log &
 
 
 To evaluate the policy, run the same command but add ``--eval``. This loads the best validation checkpoint.

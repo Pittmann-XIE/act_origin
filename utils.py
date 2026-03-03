@@ -3,6 +3,7 @@ import torch
 import os
 import h5py
 from torch.utils.data import TensorDataset, DataLoader
+import cv2
 
 import IPython
 e = IPython.embed
@@ -13,6 +14,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
+        print(f"dataset_dir: {self.dataset_dir}, camera_names: {self.camera_names}")
         self.norm_stats = norm_stats
         self.is_sim = None
         self.__getitem__(0) # initialize self.is_sim
@@ -37,8 +39,16 @@ class EpisodicDataset(torch.utils.data.Dataset):
             qpos = root['/observations/qpos'][start_ts]
             qvel = root['/observations/qvel'][start_ts]
             image_dict = dict()
+            # for cam_name in self.camera_names:
+            #     image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
             for cam_name in self.camera_names:
-                image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
+                if cam_name=='top_cropped_1':
+                    img = root[f'/observations/images/{cam_name}'][0]
+                else:
+                    img = root[f'/observations/images/{cam_name}'][start_ts]
+                if img.shape[0] != 480 or img.shape[1] != 640:
+                        img = cv2.resize(img, (640, 480), interpolation=cv2.INTER_AREA)
+                image_dict[cam_name] = img
             # get all actions after and including start_ts
             if is_sim:
                 action = root['/action'][start_ts:]
@@ -72,9 +82,27 @@ class EpisodicDataset(torch.utils.data.Dataset):
         image_data = image_data / 255.0
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
+        
+        
+        ## edit starts
+        # Load YOLO bounding box label
+        # Format:[class, x_center, y_center, width, height]
+        box_data = np.zeros(5, dtype=np.float32)
+        for cam_name in self.camera_names:
+            # Clean up derived camera names (e.g., 'top_cropped_1' -> 'top') to find the label folder
+            label_path = os.path.join(self.dataset_dir, 'yolo_labels', f'episode_{episode_id}', cam_name, f'{int(start_ts):05d}.txt')
+            if os.path.exists(label_path):
+                with open(label_path, 'r') as f:
+                    line = f.readline().strip()
+                    if line:
+                        parts = line.split()
+                        if len(parts) >= 5 and parts[0] == '0': # Assuming class '0' is the object of interest
+                            box_data = np.array([float(x) for x in parts[:5]], dtype=np.float32)
+                            break # We just need one bounding box for the auxiliary loss
+        box_tensor = torch.from_numpy(box_data).float()
 
-        return image_data, qpos_data, action_data, is_pad
-
+        return image_data, qpos_data, action_data, is_pad, box_tensor
+    
 
 def get_norm_stats(dataset_dir, num_episodes):
     all_qpos_data = []

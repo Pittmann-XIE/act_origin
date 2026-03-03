@@ -15,7 +15,10 @@ from constants import PUPPET_GRIPPER_VELOCITY_NORMALIZE_FN
 import IPython
 e = IPython.embed
 
+# BOX_POSE = [None] # to be changed from outside
+# Add ENABLE_DISTRACTOR right below BOX_POSE
 BOX_POSE = [None] # to be changed from outside
+ENABLE_DISTRACTOR = [True] # Controls if the distractor is in view
 
 def make_sim_env(task_name):
     """
@@ -123,18 +126,101 @@ class TransferCubeTask(BimanualViperXTask):
         super().__init__(random=random)
         self.max_reward = 4
 
+    # def initialize_episode(self, physics):
+    #     """Sets the state of the environment at the start of each episode."""
+    #     # TODO Notice: this function does not randomize the env configuration. Instead, set BOX_POSE from outside
+    #     # reset qpos, control and box position
+    #     with physics.reset_context():
+    #         physics.named.data.qpos[:16] = START_ARM_POSE
+    #         np.copyto(physics.data.ctrl, START_ARM_POSE)
+    #         assert BOX_POSE[0] is not None
+    #         physics.named.data.qpos[-7:] = BOX_POSE[0]
+    #         # print(f"{BOX_POSE=}")
+    #     super().initialize_episode(physics)
+    
     def initialize_episode(self, physics):
         """Sets the state of the environment at the start of each episode."""
-        # TODO Notice: this function does not randomize the env configuration. Instead, set BOX_POSE from outside
-        # reset qpos, control and box position
         with physics.reset_context():
             physics.named.data.qpos[:16] = START_ARM_POSE
             np.copyto(physics.data.ctrl, START_ARM_POSE)
             assert BOX_POSE[0] is not None
-            physics.named.data.qpos[-7:] = BOX_POSE[0]
-            # print(f"{BOX_POSE=}")
-        super().initialize_episode(physics)
+            
+            # Helper to calculate qpos index for a free joint
+            id2index = lambda j_id: 16 + (j_id - 16) * 7 
+            
+            # 1. Set position for the target red box
+            red_box_id = physics.model.name2id('red_box_joint', 'joint')
+            red_box_idx = id2index(red_box_id)
+            physics.data.qpos[red_box_idx : red_box_idx + 7] = BOX_POSE[0]
+            
+            # 2. Get indices for both distractors
+            dist1_id = physics.model.name2id('distractor_1_joint', 'joint')
+            dist1_idx = id2index(dist1_id)
+            
+            dist2_id = physics.model.name2id('distractor_2_joint', 'joint')
+            dist2_idx = id2index(dist2_id)
+            
+            if ENABLE_DISTRACTOR[0]:
+                red_x, red_y = BOX_POSE[0][0], BOX_POSE[0][1]
+                
+                # --- Position Distractor 1 ---
+                dist1_x, dist1_y = red_x, red_y
+                while np.sqrt((dist1_x - red_x)**2 + (dist1_y - red_y)**2) < 0.04:
+                    dist1_x = np.random.uniform(0.0, 0.2)
+                    dist1_y = np.random.uniform(0.4, 0.6)
+                
+                dist1_pose = BOX_POSE[0].copy()
+                dist1_pose[0], dist1_pose[1] = dist1_x, dist1_y
+                
+                # --- Position Distractor 2 ---
+                dist2_x, dist2_y = red_x, red_y
+                # Check distance against BOTH the target box and distractor 1
+                while (np.sqrt((dist2_x - red_x)**2 + (dist2_y - red_y)**2) < 0.04) or \
+                      (np.sqrt((dist2_x - dist1_x)**2 + (dist2_y - dist1_y)**2) < 0.04):
+                    dist2_x = np.random.uniform(0.0, 0.2)
+                    dist2_y = np.random.uniform(0.4, 0.6)
+                
+                dist2_pose = BOX_POSE[0].copy()
+                dist2_pose[0], dist2_pose[1] = dist2_x, dist2_y
 
+            else:
+                # --- Hide BOTH distractors far below the table ---
+                dist1_pose = BOX_POSE[0].copy()
+                dist1_pose[2] = -10.0 
+                
+                dist2_pose = BOX_POSE[0].copy()
+                dist2_pose[2] = -10.0 
+            
+            # Apply poses to the physics engine
+            physics.data.qpos[dist1_idx : dist1_idx + 7] = dist1_pose
+            physics.data.qpos[dist2_idx : dist2_idx + 7] = dist2_pose
+            
+        super().initialize_episode(physics)
+    
+    # Add this to the TransferCubeTask class in sim_env.py
+    def check_distractor_collision(self, physics):
+        for i_contact in range(physics.data.ncon):
+            id_geom_1 = physics.data.contact[i_contact].geom1
+            id_geom_2 = physics.data.contact[i_contact].geom2
+            name_1 = physics.model.id2name(id_geom_1, 'geom')
+            name_2 = physics.model.id2name(id_geom_2, 'geom')
+            
+            # Define what constitutes a "illegal" collision
+            illegal_names = ['distractor_1', 'distractor_2']
+            robot_parts = ['vx300s_left', 'vx300s_right']
+            target_obj = 'red_box'
+            
+            pair = (name_1, name_2)
+            for d in illegal_names:
+                # Check if distractor hit the target object
+                if d in pair and target_obj in pair:
+                    return True
+                # Check if distractor hit any part of the robot
+                for r in robot_parts:
+                    if d in pair and any(r in n for n in pair):
+                        return True
+        return False
+        
     @staticmethod
     def get_env_state(physics):
         env_state = physics.data.qpos.copy()[16:]

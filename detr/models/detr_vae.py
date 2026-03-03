@@ -55,7 +55,7 @@ class DETRVAE(nn.Module):
         if backbones is not None:
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
             self.backbones = nn.ModuleList(backbones)
-            self.input_proj_robot_state = nn.Linear(14, hidden_dim)
+            self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
         else:
             # input_dim = 14 + 7 # robot_state + env_state
             self.input_proj_robot_state = nn.Linear(14, hidden_dim)
@@ -66,14 +66,22 @@ class DETRVAE(nn.Module):
         # encoder extra parameters
         self.latent_dim = 32 # final size of latent z # TODO tune
         self.cls_embed = nn.Embedding(1, hidden_dim) # extra cls token embedding
-        self.encoder_action_proj = nn.Linear(14, hidden_dim) # project action to embedding
-        self.encoder_joint_proj = nn.Linear(14, hidden_dim)  # project qpos to embedding
+        self.encoder_action_proj = nn.Linear(state_dim, hidden_dim) # project action to embedding
+        self.encoder_joint_proj = nn.Linear(state_dim, hidden_dim)  # project qpos to embedding
         self.latent_proj = nn.Linear(hidden_dim, self.latent_dim*2) # project hidden state to latent std, var
         self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], qpos, a_seq
 
         # decoder extra parameters
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
+        
+        self.object_detection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 4),
+           nn.Sigmoid()
+           )
+ 
 
     def forward(self, qpos, image, env_state, actions=None, is_pad=None):
         """
@@ -118,7 +126,7 @@ class DETRVAE(nn.Module):
             all_cam_features = []
             all_cam_pos = []
             for cam_id, cam_name in enumerate(self.camera_names):
-                features, pos = self.backbones[0](image[:, cam_id]) # HARDCODED
+                features, pos = self.backbones[cam_id](image[:, cam_id]) # HARDCODED
                 features = features[0] # take the last layer feature
                 pos = pos[0]
                 all_cam_features.append(self.input_proj(features))
@@ -128,15 +136,24 @@ class DETRVAE(nn.Module):
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
-            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+            # hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+            # --- MODIFICATION START ---
+            hs, attn_weights, = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)
+            # hs = hs[0] # Original code might have done this, we unpack tuple now
+            # --- MODIFICATION END ---
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
             transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2
-            hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
+            # hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
+            hs,attn_weights = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)
+        # --- MODIFICATION START ---   
+        hs = hs[0] # Take the output from the last decoder layer
+        # --- MODIFICATION END ---
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
-        return a_hat, is_pad_hat, [mu, logvar]
+        box_hat = self.object_detection(hs.mean(dim=1))
+        return a_hat, is_pad_hat, [mu, logvar], attn_weights, box_hat
 
 
 
@@ -228,13 +245,15 @@ def build_encoder(args):
 
 def build(args):
     state_dim = 14 # TODO hardcode
-
     # From state
     # backbone = None # from state for now, no need for conv nets
     # From image
     backbones = []
-    backbone = build_backbone(args)
-    backbones.append(backbone)
+    # backbone = build_backbone(args)
+    # backbones.append(backbone)
+    for _ in args.camera_names:
+        backbone = build_backbone(args)
+        backbones.append(backbone)
 
     transformer = build_transformer(args)
 
@@ -275,3 +294,4 @@ def build_cnnmlp(args):
     print("number of parameters: %.2fM" % (n_parameters/1e6,))
 
     return model
+
