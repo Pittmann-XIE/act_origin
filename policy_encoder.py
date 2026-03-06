@@ -16,16 +16,18 @@ class ACTPolicy(nn.Module):
         self.box_weight = args_override.get('box_weight', 1.0)
         print(f'KL Weight {self.kl_weight} | Box Weight {self.box_weight}')
 
-    def __call__(self, qpos, image, actions=None, is_pad=None, box_data=None):
+    def __call__(self, qpos, image_encoder, image_decoder, actions=None, is_pad=None, box_data=None):
         env_state = None
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-        image = normalize(image)
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        
+        image_encoder = normalize(image_encoder)
+        image_decoder = normalize(image_decoder)
+        
         if actions is not None: # training time
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]
 
-            a_hat, is_pad_hat, (mu, logvar), _, box_hat = self.model(qpos, image, env_state, actions, is_pad)
+            a_hat, is_pad_hat, (mu, logvar), _, box_hat = self.model(qpos, image_encoder, image_decoder, env_state, actions, is_pad)
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
             all_l1 = F.l1_loss(actions, a_hat, reduction='none')
@@ -50,7 +52,7 @@ class ACTPolicy(nn.Module):
                 
             return loss_dict
         else: # inference time
-            a_hat, _, (_, _), attn_weights, box_hat = self.model(qpos, image, env_state) # no action, sample from prior
+            a_hat, _, (_, _), attn_weights, box_hat = self.model(qpos, image_encoder, image_decoder, env_state) # no action, sample from prior
             return a_hat, attn_weights, box_hat
 
     def configure_optimizers(self):

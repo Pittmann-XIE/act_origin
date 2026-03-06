@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from .models import build_ACT_model, build_CNNMLP_model
+from .models_encoder import build_ACT_model, build_CNNMLP_model
 
 import IPython
 e = IPython.embed
@@ -29,8 +29,11 @@ def get_args_parser():
     parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
     parser.add_argument('--camera_names', default=[], type=list, # will be overridden
-                        help="A list of camera names")
-
+                        help="A list of camera names")    
+    parser.add_argument('--camera_names_encoder', default=[], type=list, # will be overridden
+                        help="A list of camera names")    
+    parser.add_argument('--camera_names_decoder', default=[], type=list, # will be overridden
+                        help="A list of camera names")    
     # * Transformer
     parser.add_argument('--enc_layers', default=4, type=int, # will be overridden
                         help="Number of encoding layers in the transformer")
