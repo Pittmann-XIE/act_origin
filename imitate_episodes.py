@@ -25,14 +25,6 @@ e = IPython.embed
 import matplotlib.pyplot as plt
 import cv2
 
-# import sys
-# import os
-# # Ensure the root directory is in the path
-# repo_root = '/home/pengtao/ws_ros2humble-main_lab/sam2'
-# if repo_root not in sys.path:
-#     sys.path.append(repo_root)
-
-# # CORRECT IMPORT:
 try:
     from sam2.build_sam import build_sam2_video_predictor
 except ImportError as e:
@@ -81,67 +73,6 @@ def get_square_crop(raw_frame, mask, padding=10, target_size=(640, 480)):
         return cv2.resize(raw_frame, target_size)
         
     return cv2.resize(crop, target_size)
-
-
-# def visualize_attention(curr_image, attn_weights, camera_names):
-#     """
-#     Overlay attention map on the current image.
-#     curr_image: Tensor (1, num_cameras, C, H, W)
-#     attn_weights: Tensor (1, num_queries, seq_len)
-#     """
-#     # 1. Process Images
-#     # (1, num_cameras, C, H, W) -> (num_cameras, H, W, C)
-#     curr_images_np = curr_image.detach().cpu().numpy().squeeze(0).transpose(0, 2, 3, 1)
-
-#     # 2. Process Attention Weights
-#     # (1, num_queries, seq_len) -> (num_queries, seq_len)
-#     attn_weights = attn_weights.detach().cpu().numpy().squeeze(0)
-    
-#     # Average attention across all queries (what is the policy looking at generally)
-#     # Shape: (seq_len,)
-#     attn_map = np.mean(attn_weights, axis=0) 
-    
-#     # Remove the first 2 tokens (Latent and Proprioception)
-#     # The transformer source sequence is constructed as [latent, proprio, cam1, cam2...]
-#     attn_map = attn_map[2:] 
-
-#     # 3. Dimensions for ResNet18 (Standard DETR backbone)
-#     # Input 480x640 -> Feature Map 15x20 (Stride 32)
-#     h_feat, w_feat = 15, 20
-    
-#     vis_images = []
-    
-#     for cam_idx in range(len(camera_names)):
-#         # Calculate indices for this camera in the flattened sequence
-#         start_idx = cam_idx * (h_feat * w_feat)
-#         end_idx = (cam_idx + 1) * (h_feat * w_feat)
-        
-#         # Extract and reshape
-#         cam_attn = attn_map[start_idx:end_idx]
-#         cam_attn_2d = cam_attn.reshape(h_feat, w_feat)
-        
-#         # Normalize attention map 0-1
-#         cam_attn_2d = cam_attn_2d - cam_attn_2d.min()
-#         cam_attn_2d = cam_attn_2d / (cam_attn_2d.max() + 1e-8)
-        
-#         # Resize to original image size
-#         img_h, img_w = curr_images_np[cam_idx].shape[:2]
-#         cam_attn_resized = cv2.resize(cam_attn_2d, (img_w, img_h))
-        
-#         # Apply Colormap (JET)
-#         # Note: cv2 uses BGR, we convert to RGB
-#         heatmap = cv2.applyColorMap(np.uint8(255 * cam_attn_resized), cv2.COLORMAP_JET)
-#         heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
-        
-#         # Overlay: 60% Image, 40% Heatmap
-#         original_img = curr_images_np[cam_idx]
-#         overlayed_img = 0.6 * original_img + 0.4 * heatmap
-        
-#         vis_images.append(overlayed_img)
-        
-#     # Concatenate cameras horizontally
-#     return np.concatenate(vis_images, axis=1)
-
 
 def visualize_attention(curr_image, attn_weights, camera_names):
     """
@@ -326,169 +257,6 @@ def get_image(ts, camera_names):
     curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
     return curr_image
 
-
-# def eval_bc(config, ckpt_name, save_episode=True):
-#     set_seed(1000)
-#     ckpt_dir = config['ckpt_dir']
-#     state_dim = config['state_dim']
-#     real_robot = config['real_robot']
-#     policy_class = config['policy_class']
-#     onscreen_render = config['onscreen_render']
-#     policy_config = config['policy_config']
-#     camera_names = config['camera_names']
-#     max_timesteps = config['episode_len']
-#     task_name = config['task_name']
-#     temporal_agg = config['temporal_agg']
-#     onscreen_cam = 'angle'
-
-#     # load policy and stats
-#     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
-#     policy = make_policy(policy_class, policy_config)
-#     loading_status = policy.load_state_dict(torch.load(ckpt_path))
-#     print(loading_status)
-#     policy.cuda()
-#     policy.eval()
-#     print(f'Loaded: {ckpt_path}')
-#     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
-#     with open(stats_path, 'rb') as f:
-#         stats = pickle.load(f)
-
-#     pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
-#     post_process = lambda a: a * stats['action_std'] + stats['action_mean']
-
-#     # load environment
-#     if real_robot:
-#         from aloha_scripts.robot_utils import move_grippers # requires aloha
-#         from aloha_scripts.real_env import make_real_env # requires aloha
-#         env = make_real_env(init_node=True)
-#         env_max_reward = 0
-#     else:
-#         from sim_env import make_sim_env
-#         env = make_sim_env(task_name)
-#         env_max_reward = env.task.max_reward
-
-#     query_frequency = policy_config['num_queries']
-#     if temporal_agg:
-#         query_frequency = 1
-#         num_queries = policy_config['num_queries']
-
-#     max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
-
-#     num_rollouts = 50
-#     episode_returns = []
-#     highest_rewards = []
-#     for rollout_id in range(num_rollouts):
-#         rollout_id += 0
-#         ### set task
-#         if 'sim_transfer_cube' in task_name:
-#             BOX_POSE[0] = sample_box_pose() # used in sim reset
-#         elif 'sim_insertion' in task_name:
-#             BOX_POSE[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
-
-#         ts = env.reset()
-
-#         ### onscreen render
-#         if onscreen_render:
-#             ax = plt.subplot()
-#             plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
-#             plt.ion()
-
-#         ### evaluation loop
-#         if temporal_agg:
-#             all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
-
-#         qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
-#         image_list = [] # for visualization
-#         qpos_list = []
-#         target_qpos_list = []
-#         rewards = []
-#         with torch.inference_mode():
-#             for t in range(max_timesteps):
-#                 ### update onscreen render and wait for DT
-#                 if onscreen_render:
-#                     image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
-#                     plt_img.set_data(image)
-#                     plt.pause(DT)
-
-#                 ### process previous timestep to get qpos and image_list
-#                 obs = ts.observation
-#                 if 'images' in obs:
-#                     image_list.append(obs['images'])
-#                 else:
-#                     image_list.append({'main': obs['image']})
-#                 qpos_numpy = np.array(obs['qpos'])
-#                 qpos = pre_process(qpos_numpy)
-#                 qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
-#                 qpos_history[:, t] = qpos
-#                 curr_image = get_image(ts, camera_names)
-
-#                 ### query policy
-#                 if config['policy_class'] == "ACT":
-#                     if t % query_frequency == 0:
-#                         all_actions = policy(qpos, curr_image)
-#                     if temporal_agg:
-#                         all_time_actions[[t], t:t+num_queries] = all_actions
-#                         actions_for_curr_step = all_time_actions[:, t]
-#                         actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
-#                         actions_for_curr_step = actions_for_curr_step[actions_populated]
-#                         k = 0.01
-#                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
-#                         exp_weights = exp_weights / exp_weights.sum()
-#                         exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
-#                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
-#                     else:
-#                         raw_action = all_actions[:, t % query_frequency]
-#                 elif config['policy_class'] == "CNNMLP":
-#                     raw_action = policy(qpos, curr_image)
-#                 else:
-#                     raise NotImplementedError
-
-#                 ### post-process actions
-#                 raw_action = raw_action.squeeze(0).cpu().numpy()
-#                 action = post_process(raw_action)
-#                 target_qpos = action
-
-#                 ### step the environment
-#                 ts = env.step(target_qpos)
-
-#                 ### for visualization
-#                 qpos_list.append(qpos_numpy)
-#                 target_qpos_list.append(target_qpos)
-#                 rewards.append(ts.reward)
-
-#             plt.close()
-#         if real_robot:
-#             move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)  # open
-#             pass
-
-#         rewards = np.array(rewards)
-#         episode_return = np.sum(rewards[rewards!=None])
-#         episode_returns.append(episode_return)
-#         episode_highest_reward = np.max(rewards)
-#         highest_rewards.append(episode_highest_reward)
-#         print(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
-
-#         if save_episode:
-#             save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
-
-#     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
-#     avg_return = np.mean(episode_returns)
-#     summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'
-#     for r in range(env_max_reward+1):
-#         more_or_equal_r = (np.array(highest_rewards) >= r).sum()
-#         more_or_equal_r_rate = more_or_equal_r / num_rollouts
-#         summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n'
-
-#     print(summary_str)
-
-#     # save success rate to txt
-#     result_file_name = 'result_' + ckpt_name.split('.')[0] + '.txt'
-#     with open(os.path.join(ckpt_dir, result_file_name), 'w') as f:
-#         f.write(summary_str)
-#         f.write(repr(episode_returns))
-#         f.write('\n\n')
-#         f.write(repr(highest_rewards))
-
 #     return success_rate, avg_return
 def eval_bc(config, ckpt_name, save_episode=True):
     set_seed(config['seed'])
@@ -503,6 +271,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
     task_name = config['task_name']
     temporal_agg = config['temporal_agg']
     onscreen_cam = 'angle'
+
+    # Check if SAM 2 is needed based on camera names containing 'cropped'
+    use_sam2 = any('cropped' in cam for cam in camera_names)
 
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
@@ -519,13 +290,16 @@ def eval_bc(config, ckpt_name, save_episode=True):
     pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
     post_process = lambda a: a * stats['action_std'] + stats['action_mean']
     
-    # 1. Initialize SAM 2 Small for speed
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    sam2_predictor = build_sam2_video_predictor(
-        "configs/sam2.1/sam2.1_hiera_s.yaml", # SMALL MODEL
-        "/home/pengtao/ws_ros2humble-main_lab/sam2/checkpoints/sam2.1_hiera_small.pt", 
-        device=device
-    )
+    # 1. Initialize SAM 2 Small conditionally
+    if use_sam2:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        sam2_predictor = build_sam2_video_predictor(
+            "configs/sam2.1/sam2.1_hiera_s.yaml", # SMALL MODEL
+            "/home/pengtao/ws_ros2humble-main_lab/sam2/checkpoints/sam2.1_hiera_small.pt", 
+            device=device
+        )
+    else:
+        sam2_predictor = None
 
     # load environment
     if real_robot:
@@ -545,287 +319,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
     max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
 
-    # num_rollouts = 50
-    # episode_returns = []
-    # highest_rewards = []
-    # for rollout_id in range(num_rollouts):
-    #     rollout_id += 0
-    #     ### set task
-    #     if 'sim_transfer_cube' in task_name:
-    #         BOX_POSE[0] = sample_box_pose() # used in sim reset
-    #     elif 'sim_insertion' in task_name:
-    #         BOX_POSE[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
-
-    #     ts = env.reset()
-
-    #     ### onscreen render
-    #     if onscreen_render:
-    #         ax = plt.subplot()
-    #         plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
-    #         plt.ion()
-
-    #     ### evaluation loop
-    #     if temporal_agg:
-    #         all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
-
-    #     qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
-    #     image_list = [] # for visualization
-    #     qpos_list = []
-    #     target_qpos_list = []
-    #     rewards = []
-        
-    #     # List to store attention overlays
-    #     attn_vis_list = []
-    #     # Store latest attention weights for temporal aggregation
-    #     curr_attn_weights = None
-
-    #     with torch.inference_mode():
-    #         for t in range(max_timesteps):
-    #             ### update onscreen render and wait for DT
-    #             if onscreen_render:
-    #                 image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
-    #                 plt_img.set_data(image)
-    #                 plt.pause(DT)
-
-    #             ### process previous timestep to get qpos and image_list
-    #             obs = ts.observation
-    #             if 'images' in obs:
-    #                 image_list.append(obs['images'])
-    #             else:
-    #                 image_list.append({'main': obs['image']})
-    #             qpos_numpy = np.array(obs['qpos'])
-    #             qpos = pre_process(qpos_numpy)
-    #             qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
-    #             qpos_history[:, t] = qpos
-    #             curr_image = get_image(ts, camera_names)
-
-    #             ### query policy
-    #             if config['policy_class'] == "ACT":
-    #                 if t % query_frequency == 0:
-    #                     # UPDATE: Unpack attention weights from policy
-    #                     all_actions, curr_attn_weights = policy(qpos, curr_image)
-                    
-    #                 if temporal_agg:
-    #                     all_time_actions[[t], t:t+num_queries] = all_actions
-    #                     actions_for_curr_step = all_time_actions[:, t]
-    #                     actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
-    #                     actions_for_curr_step = actions_for_curr_step[actions_populated]
-    #                     k = 0.01
-    #                     exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
-    #                     exp_weights = exp_weights / exp_weights.sum()
-    #                     exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
-    #                     raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
-    #                 else:
-    #                     raw_action = all_actions[:, t % query_frequency]
-    #             elif config['policy_class'] == "CNNMLP":
-    #                 raw_action = policy(qpos, curr_image)
-    #                 curr_attn_weights = None # No attention for CNNMLP
-    #             else:
-    #                 raise NotImplementedError
-
-    #             ### post-process actions
-    #             raw_action = raw_action.squeeze(0).cpu().numpy()
-    #             action = post_process(raw_action)
-    #             target_qpos = action
-
-    #             ### step the environment
-    #             ts = env.step(target_qpos)
-
-    #             ### for visualization
-    #             qpos_list.append(qpos_numpy)
-    #             target_qpos_list.append(target_qpos)
-    #             rewards.append(ts.reward)
-                
-    #             ### Process Attention Visualization
-    #             if save_episode and curr_attn_weights is not None:
-    #                 vis_img = visualize_attention(curr_image, curr_attn_weights, camera_names)
-    #                 attn_vis_list.append(vis_img)
-
-    #         plt.close()
-    #     if real_robot:
-    #         move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)  # open
-    #         pass
-
-    #     rewards = np.array(rewards)
-    #     episode_return = np.sum(rewards[rewards!=None])
-    #     episode_returns.append(episode_return)
-    #     episode_highest_reward = np.max(rewards)
-    #     highest_rewards.append(episode_highest_reward)
-    #     print(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
-
-    #     if save_episode:
-    #         # Save standard video
-    #         save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
-            
-    #         if len(attn_vis_list) > 0:
-    #             print(f"Saving attention video for rollout {rollout_id}...")
-    #             attn_video_path = os.path.join(ckpt_dir, f'video_attn_{rollout_id}.mp4')
-                
-    #             # Convert list of float arrays [0, 1] to uint8 [0, 255]
-    #             attn_frames = [np.uint8(frame * 255) for frame in attn_vis_list]
-                
-    #             # --- FIX START: Use cv2.VideoWriter instead of imageio ---
-    #             # Get dimensions (Height, Width, Channels)
-    #             h, w, _ = attn_frames[0].shape
-                
-    #             # Define codec (mp4v is standard for .mp4)
-    #             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                
-    #             # Create VideoWriter: Path, Codec, FPS, (Width, Height)
-    #             out = cv2.VideoWriter(attn_video_path, fourcc, int(1/DT), (w, h))
-                
-    #             for frame in attn_frames:
-    #                 # attn_frames are RGB (from our visualization function)
-    #                 # cv2 expects BGR for writing, so we convert back
-    #                 out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-                
-    #             out.release()
-
     num_rollouts = 50
     episode_returns = []
     highest_rewards = []
     
-    # for rollout_id in range(num_rollouts):
-    #     print(f"\n--- Starting Rollout {rollout_id} ---")
-        
-    #     # 1. Sample the static box position ONCE for this rollout so it's identical for both runs
-    #     if 'sim_transfer_cube' in task_name:
-    #         base_box_pose = sample_box_pose() 
-    #     elif 'sim_insertion' in task_name:
-    #         base_box_pose = np.concatenate(sample_insertion_pose()) 
-    #     else:
-    #         base_box_pose = None
-
-    #     # 2. Run the full episode twice: once without distractor, once with
-    #     for has_distractor in [False, True]:
-    #         # Set the flag and reset the target box pose
-    #         ENABLE_DISTRACTOR[0] = has_distractor
-    #         if base_box_pose is not None:
-    #             BOX_POSE[0] = base_box_pose.copy()
-            
-    #         ts = env.reset()
-
-    #         ### onscreen render setup
-    #         if onscreen_render:
-    #             ax = plt.subplot()
-    #             plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
-    #             plt.ion()
-
-    #         if temporal_agg:
-    #             all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
-
-    #         qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
-    #         image_list = [] 
-    #         qpos_list = []
-    #         target_qpos_list = []
-    #         rewards = []
-            
-    #         attn_vis_list = []
-    #         curr_attn_weights = None
-
-    #         print(f"Running evaluation (Distractor: {has_distractor})...")
-            
-    #         with torch.inference_mode():
-    #             for t in range(max_timesteps):
-    #                 if onscreen_render:
-    #                     image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
-    #                     plt_img.set_data(image)
-    #                     plt.pause(DT)
-
-    #                 obs = ts.observation
-    #                 if 'images' in obs:
-    #                     image_list.append(obs['images'])
-    #                 else:
-    #                     image_list.append({'main': obs['image']})
-                        
-    #                 qpos_numpy = np.array(obs['qpos'])
-    #                 qpos = pre_process(qpos_numpy)
-    #                 qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
-    #                 qpos_history[:, t] = qpos
-    #                 curr_image = get_image(ts, camera_names)
-
-    #                 # Query policy
-    #                 if config['policy_class'] == "ACT":
-    #                     if t % query_frequency == 0:
-    #                         all_actions, curr_attn_weights = policy(qpos, curr_image)
-                        
-    #                     if temporal_agg:
-    #                         all_time_actions[[t], t:t+num_queries] = all_actions
-    #                         actions_for_curr_step = all_time_actions[:, t]
-    #                         actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
-    #                         actions_for_curr_step = actions_for_curr_step[actions_populated]
-    #                         k = 0.01
-    #                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
-    #                         exp_weights = exp_weights / exp_weights.sum()
-    #                         exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
-    #                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
-    #                     else:
-    #                         raw_action = all_actions[:, t % query_frequency]
-    #                 elif config['policy_class'] == "CNNMLP":
-    #                     raw_action = policy(qpos, curr_image)
-    #                     curr_attn_weights = None
-    #                 else:
-    #                     raise NotImplementedError
-
-    #                 # Post-process actions
-    #                 raw_action = raw_action.squeeze(0).cpu().numpy()
-    #                 action = post_process(raw_action)
-    #                 target_qpos = action
-
-    #                 # Step the environment
-    #                 ts = env.step(target_qpos)
-
-    #                 qpos_list.append(qpos_numpy)
-    #                 target_qpos_list.append(target_qpos)
-    #                 rewards.append(ts.reward)
-                    
-    #                 # Process Attention Visualization for EVERY timestep
-    #                 if save_episode and curr_attn_weights is not None:
-    #                     vis_img = visualize_attention(curr_image, curr_attn_weights, camera_names)
-    #                     attn_vis_list.append(vis_img)
-
-    #             if onscreen_render:
-    #                 plt.close()
-
-    #         if real_robot:
-    #             from aloha_scripts.robot_utils import move_grippers
-    #             from constants import PUPPET_GRIPPER_JOINT_OPEN
-    #             move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)
-
-    #         # Record stats (we can record stats for both, or just print them)
-    #         rewards = np.array(rewards)
-    #         episode_return = np.sum(rewards[rewards!=None])
-    #         episode_highest_reward = np.max(rewards)
-            
-    #         # To avoid double-counting in standard metrics, you might only append to global lists when has_distractor == True
-    #         if has_distractor:
-    #             episode_returns.append(episode_return)
-    #             highest_rewards.append(episode_highest_reward)
-                
-    #         print(f'Result -> Return: {episode_return}, Highest Reward: {episode_highest_reward}, Success: {episode_highest_reward==env_max_reward}')
-
-    #         # 3. Save the videos immediately after the run completes
-    #         if save_episode:
-    #             suffix = "with_distractor" if has_distractor else "no_distractor"
-                
-    #             # Save standard top/angle view video
-    #             save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video_{suffix}_{rollout_id}.mp4'))
-                
-    #             # Save the full attention video
-    #             if len(attn_vis_list) > 0:
-    #                 print(f"Saving attention video ({suffix}) for rollout {rollout_id}...")
-    #                 attn_video_path = os.path.join(ckpt_dir, f'video_attn_{suffix}_{rollout_id}.mp4')
-                    
-    #                 attn_frames = [np.uint8(frame * 255) for frame in attn_vis_list]
-    #                 h, w, _ = attn_frames[0].shape
-    #                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    #                 out = cv2.VideoWriter(attn_video_path, fourcc, int(1/DT), (w, h))
-                    
-    #                 for frame in attn_frames:
-    #                     out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-                    
-    #                 out.release()
-    for rollout_id in range(25, num_rollouts, 1):
+    for rollout_id in range(num_rollouts):
         print(f"\n--- Starting Rollout {rollout_id} ---")
         
         # 1. Sample the static box position ONCE for this rollout so it's identical for both runs
@@ -846,40 +344,40 @@ def eval_bc(config, ckpt_name, save_episode=True):
             ts = env.reset()
 
             ### --- SAM 2 INITIALIZATION FOR THIS EPISODE --- ###
-            # Define which camera we are tracking the object in
-            track_cam_name = config['camera_names'][0] 
-            first_frame = ts.observation['images'][track_cam_name]
-            
-            # 1. Prompt user to click the object
-            print(f"Waiting for user to click object in {track_cam_name}...")
-            click_pt = get_user_click(first_frame)
-            
-            # --- UPDATED FOR PARALLEL RUNS ---
-            # Use the Process ID (PID) to create a unique directory path
-            video_dir = f"/tmp/sam2_temp_rollout_{os.getpid()}"
-            os.makedirs(video_dir, exist_ok=True)
-            
-            # Clear old frames from this specific instance to avoid confusion
-            for f in os.listdir(video_dir):
-                os.remove(os.path.join(video_dir, f))
-            
-            # Save the first frame as 00000.jpg
-            cv2.imwrite(os.path.join(video_dir, "00000.jpg"), cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
-            
-            # Offload video and state to CPU to save massive amounts of GPU VRAM
-            inference_state = sam2_predictor.init_state(
-                video_path=video_dir,
-                offload_video_to_cpu=True,
-                offload_state_to_cpu=True
-            )
-            
-            sam2_predictor.add_new_points(
-                inference_state=inference_state,
-                frame_idx=0,
-                obj_id=1,
-                points=np.array([click_pt], dtype=np.float32),
-                labels=np.array([1], np.int32)
-            )
+            if use_sam2:
+                # Assuming the primary uncropped camera is the first one in the config to track from
+                track_cam_name = [cam for cam in camera_names if 'cropped' not in cam][0] if any('cropped' not in cam for cam in camera_names) else camera_names[0]
+                first_frame = ts.observation['images'][track_cam_name]
+                
+                # Prompt user to click the object
+                print(f"Waiting for user to click object in {track_cam_name}...")
+                click_pt = get_user_click(first_frame)
+                
+                # Use the Process ID (PID) to create a unique directory path
+                video_dir = f"/tmp/sam2_temp_rollout_{os.getpid()}"
+                os.makedirs(video_dir, exist_ok=True)
+                
+                # Clear old frames from this specific instance to avoid confusion
+                for f in os.listdir(video_dir):
+                    os.remove(os.path.join(video_dir, f))
+                
+                # Save the first frame as 00000.jpg
+                cv2.imwrite(os.path.join(video_dir, "00000.jpg"), cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
+                
+                # Offload video and state to CPU to save massive amounts of GPU VRAM
+                inference_state = sam2_predictor.init_state(
+                    video_path=video_dir,
+                    offload_video_to_cpu=True,
+                    offload_state_to_cpu=True
+                )
+                
+                sam2_predictor.add_new_points(
+                    inference_state=inference_state,
+                    frame_idx=0,
+                    obj_id=1,
+                    points=np.array([click_pt], dtype=np.float32),
+                    labels=np.array([1], np.int32)
+                )
             ### --------------------------------------------- ###
 
             ### onscreen render setup
@@ -899,11 +397,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
             
             attn_vis_list = []
             curr_attn_weights = None
+            curr_box_hat = None
 
             print(f"Running evaluation (Distractor: {has_distractor})...")
-            
-            # Inside eval_bc in imitate_episodes.py
-
             with torch.inference_mode():
                 for t in range(max_timesteps):
                     if onscreen_render:
@@ -914,70 +410,47 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     obs = ts.observation
                     
                    ### --- FIXED SAM 2 TRACKING & CROPPING --- ###
-                    current_frame = obs['images'][track_cam_name]
-                    
-                    # 1. Dynamically append new frames to the existing state
-                    # We skip t=0 because frame 0 was already loaded by init_state before the loop.
-                    if t > 0:
-                        # Resize to match SAM 2's internal image size
-                        img_resized = cv2.resize(
-                            current_frame, 
-                            (sam2_predictor.image_size, sam2_predictor.image_size)
-                        )
+                    if use_sam2:
+                        current_frame = obs['images'][track_cam_name]
                         
-                        # Convert HWC -> CHW and scale to [0, 1]
-                        img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
+                        if t > 0:
+                            img_resized = cv2.resize(
+                                current_frame, 
+                                (sam2_predictor.image_size, sam2_predictor.image_size)
+                            )
+                            img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
+                            img_tensor = img_tensor.unsqueeze(0).cpu()
+                            inference_state["images"] = torch.cat([inference_state["images"], img_tensor], dim=0)
+                            inference_state["num_frames"] = inference_state["images"].shape[0]
                         
-                        # Add sequence dimension: (C, H, W) -> (1, C, H, W)
-                        # Move to the exact same device as the current images
-                        # img_tensor = img_tensor.unsqueeze(0).to(inference_state["images"].device)
-                        img_tensor = img_tensor.unsqueeze(0).cpu()
+                        mask = None
+                        for out_frame_idx, out_obj_ids, out_mask_logits in sam2_predictor.propagate_in_video(
+                            inference_state, 
+                            start_frame_idx=t, 
+                            max_frame_num_to_track=1
+                        ):
+                            mask = (out_mask_logits[0] > 0.0).cpu().numpy().squeeze()
                         
-                        # Concatenate the new frame to the existing tensor
-                        inference_state["images"] = torch.cat([inference_state["images"], img_tensor], dim=0)
+                        if mask is not None:
+                            cropped_img = get_square_crop(current_frame, mask, padding=10, target_size=(640, 480))
+                        else:
+                            cropped_img = cv2.resize(current_frame, (640, 480))
                         
-                        # Update the frame counter to match the new tensor shape
-                        inference_state["num_frames"] = inference_state["images"].shape[0]
-                    
-                    # 2. Use propagate_in_video for the current frame index
-                    mask = None
-                    for out_frame_idx, out_obj_ids, out_mask_logits in sam2_predictor.propagate_in_video(
-                        inference_state, 
-                        start_frame_idx=t, 
-                        max_frame_num_to_track=1
-                    ):
-                        # We only care about our specific object (ID 1)
-                        mask = (out_mask_logits[0] > 0.0).cpu().numpy().squeeze()
-                    
-                    # 3. Generate the crop
-                    if mask is not None:
-                        cropped_img = get_square_crop(current_frame, mask, padding=10, target_size=(640, 480))
-                    else:
-                        # Fallback if tracking fails
-                        cropped_img = cv2.resize(current_frame, (640, 480))
-                    
-                    # Inject the cropped image into the observation
-                    obs['images']['top_cropped_1'] = cropped_img
+                        crop_cam_target = [cam for cam in camera_names if 'cropped' in cam][0]
+                        obs['images'][crop_cam_target] = cropped_img
                     ### --------------------------------------- ###
-
-                    if 'images' in obs:
-                        # Append a copy to avoid mutating the saved list unexpectedly
-                        image_list.append({k: v.copy() for k, v in obs['images'].items()})
-                    else:
-                        image_list.append({'main': obs['image']})
                         
                     qpos_numpy = np.array(obs['qpos'])
                     qpos = pre_process(qpos_numpy)
                     qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
                     qpos_history[:, t] = qpos
                     
-                    # get_image will now extract 'top_cropped_1' as well because we injected it
                     curr_image = get_image(ts, camera_names)
 
                     # Query policy
                     if config['policy_class'] == "ACT":
                         if t % query_frequency == 0:
-                            all_actions, curr_attn_weights = policy(qpos, curr_image)
+                            all_actions, curr_attn_weights, curr_box_hat = policy(qpos, curr_image)
                         
                         if temporal_agg:
                             all_time_actions[[t], t:t+num_queries] = all_actions
@@ -994,8 +467,73 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     elif config['policy_class'] == "CNNMLP":
                         raw_action = policy(qpos, curr_image)
                         curr_attn_weights = None
+                        curr_box_hat = None
                     else:
                         raise NotImplementedError
+
+                    ### --- DRAW BOUNDING BOX ON RAW OBSERVATION & ATTENTION MAP --- ###
+                    if curr_box_hat is not None:
+                        # Convert YOLO format (cx, cy, w, h) to standard (x1, y1, x2, y2)
+                        box = curr_box_hat.squeeze().cpu().numpy()  
+                        
+                        # Select the base camera image to draw on
+                        draw_cam_name = [cam for cam in camera_names if 'cropped' not in cam][0] if any('cropped' not in cam for cam in camera_names) else camera_names[0]
+                        
+                        if draw_cam_name in obs['images']:
+                            img_to_draw = obs['images'][draw_cam_name].copy()
+                            img_h, img_w = img_to_draw.shape[:2]
+                            
+                            cx, cy, bw, bh = box
+                            xmin = int((cx - bw / 2) * img_w)
+                            ymin = int((cy - bh / 2) * img_h)
+                            xmax = int((cx + bw / 2) * img_w)
+                            ymax = int((cy + bh / 2) * img_h)
+                            
+                            text = f"Box: ({cx:.2f}, {cy:.2f})"
+                            
+                            # 1. Draw on Original Image
+                            cv2.rectangle(img_to_draw, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
+                            cv2.putText(img_to_draw, text, (xmin, max(ymin - 10, 10)), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+                            obs['images'][draw_cam_name] = img_to_draw
+                            
+                            # 2. Draw on Attention Map (if enabled)
+                            if save_episode and curr_attn_weights is not None:
+                                vis_img = visualize_attention(curr_image, curr_attn_weights, camera_names)
+                                
+                                # Convert float image to uint8 so OpenCV can draw on it
+                                vis_img_uint8 = np.uint8(vis_img * 255).copy()
+                                
+                                # Calculate horizontal offset for the correct camera panel
+                                cam_idx = camera_names.index(draw_cam_name)
+                                x_offset = cam_idx * img_w
+                                
+                                # Draw the Box
+                                cv2.rectangle(vis_img_uint8, (xmin + x_offset, ymin), (xmax + x_offset, ymax), (0, 255, 0), 2)
+                                
+                                # Draw High-Contrast Text Background
+                                (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                                cv2.rectangle(vis_img_uint8, 
+                                              (xmin + x_offset, max(ymin - 10, 10) - text_h - 2), 
+                                              (xmin + x_offset + text_w, max(ymin - 10, 10) + 2), 
+                                              (0, 0, 0), -1)  # Solid black background
+                                              
+                                # Draw Text
+                                cv2.putText(vis_img_uint8, text, (xmin + x_offset, max(ymin - 10, 10)), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+                                
+                                attn_vis_list.append(vis_img_uint8)
+                    else:
+                        # Fallback if no box is predicted
+                        if save_episode and curr_attn_weights is not None:
+                            vis_img = visualize_attention(curr_image, curr_attn_weights, camera_names)
+                            attn_vis_list.append(np.uint8(vis_img * 255))
+                    ### ------------------------------------------------------------ ###
+
+                    if 'images' in obs:
+                        image_list.append({k: v.copy() for k, v in obs['images'].items()})
+                    else:
+                        image_list.append({'main': obs['image']})
 
                     # Post-process actions
                     raw_action = raw_action.squeeze(0).cpu().numpy()
@@ -1008,11 +546,6 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     qpos_list.append(qpos_numpy)
                     target_qpos_list.append(target_qpos)
                     rewards.append(ts.reward)
-                    
-                    # Process Attention Visualization for EVERY timestep
-                    if save_episode and curr_attn_weights is not None:
-                        vis_img = visualize_attention(curr_image, curr_attn_weights, camera_names)
-                        attn_vis_list.append(vis_img)
 
                 if onscreen_render:
                     plt.close()
@@ -1027,8 +560,6 @@ def eval_bc(config, ckpt_name, save_episode=True):
             episode_return = np.sum(rewards[rewards!=None])
             episode_highest_reward = np.max(rewards)
             
-            # Append metrics only for the distractor run to match global count, 
-            # or record both if you are tracking them separately.
             if has_distractor:
                 episode_returns.append(episode_return)
                 highest_rewards.append(episode_highest_reward)
@@ -1047,7 +578,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     print(f"Saving attention video ({suffix}) for rollout {rollout_id}...")
                     attn_video_path = os.path.join(ckpt_dir, f'video_attn_{suffix}_{rollout_id}.mp4')
                     
-                    attn_frames = [np.uint8(frame * 255) for frame in attn_vis_list]
+                    # NOTE: Images are ALREADY uint8 from our drawing logic above
+                    attn_frames = attn_vis_list 
+                    
                     h, w, _ = attn_frames[0].shape
                     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                     out = cv2.VideoWriter(attn_video_path, fourcc, int(1/DT), (w, h))
@@ -1056,10 +589,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                     
                     out.release()
-                sam2_predictor.reset_state(inference_state)
-                del inference_state
-                torch.cuda.empty_cache()
-                                  
+                
+                # Cleanup SAM 2 inference state at the end of every episode loop 
+                if use_sam2:
+                    sam2_predictor.reset_state(inference_state)
+                    del inference_state
+                    torch.cuda.empty_cache()
+
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
     summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'

@@ -72,7 +72,7 @@ To train ACT:
     # Transfer Cube task
     python3 imitate_episodes_encoder.py \
     --task_name sim_transfer_cube_scripted \
-    --ckpt_dir checkpoints_aux\
+    --ckpt_dir /mnt/Ego2Exo/checkpoints/checkpoints_aux\
     --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 16 --dim_feedforward 3200 \
     --num_epochs 4000  --lr 2e-5 \
     --seed 10 > train_encoder.log &
