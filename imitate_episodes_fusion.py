@@ -7,14 +7,13 @@ import matplotlib.pyplot as plt
 from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
-import re
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
-from utils_student import load_data # data functions
-from utils_student import sample_box_pose, sample_insertion_pose # robot functions
-from utils_student import compute_dict_mean, set_seed, detach_dict # helper functions
-from policy_student import ACTPolicy, CNNMLPPolicy
+from utils_fusion import load_data # data functions
+from utils_fusion import sample_box_pose, sample_insertion_pose # robot functions
+from utils_fusion import compute_dict_mean, set_seed, detach_dict # helper functions
+from policy_fusion import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
 
 # Import the new ENABLE_DISTRACTOR flag
@@ -23,6 +22,7 @@ from sim_env import BOX_POSE, ENABLE_DISTRACTOR
 import IPython
 e = IPython.embed
 
+import matplotlib.pyplot as plt
 import cv2
 
 try:
@@ -101,7 +101,7 @@ def visualize_attention(curr_image, attn_weights, camera_names):
     # We must reshape it to this wide format first!
     combined_attn_2d = attn_map.reshape((h_feat, w_feat * num_cams))
     
-    vis_images =[]
+    vis_images = []
     
     for cam_idx in range(num_cams):
         # Crop the specific camera's attention map out of the combined wide map
@@ -140,10 +140,7 @@ def main(args):
     task_name = args['task_name']
     batch_size_train = args['batch_size']
     batch_size_val = args['batch_size']
-    
-    # Automatically switch epochs based on stage arguments
-    stage_1_epochs = args.get('stage_1_epochs', 0)
-    stage_2_epochs = args.get('stage_2_epochs', 0)
+    num_epochs = args['num_epochs']
 
     # get task parameters
     is_sim = task_name[:4] == 'sim_'
@@ -177,6 +174,7 @@ def main(args):
                          'dec_layers': dec_layers,
                          'nheads': nheads,
                          'camera_names': camera_names,
+                         'fusion_type': args['fusion_type']
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -185,8 +183,7 @@ def main(args):
         raise NotImplementedError
 
     config = {
-        'stage_1_epochs': stage_1_epochs,
-        'stage_2_epochs': stage_2_epochs,
+        'num_epochs': num_epochs,
         'ckpt_dir': ckpt_dir,
         'episode_len': episode_len,
         'state_dim': state_dim,
@@ -199,26 +196,19 @@ def main(args):
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
         'real_robot': not is_sim,
-        'resume_ckpt': args.get('resume_ckpt', None) # Provide support for continue training
+        'resume_ckpt_path': args.get('resume_ckpt_path', None)
     }
 
     if is_eval:
-        # Load best student checkpoint by default for evaluation
-        ckpt_names =[f'policy_best_stage2_seed_{args["seed"]}.ckpt', f'policy_best.ckpt']
-        
-        # Determine which checkpoint actually exists
-        eval_ckpt = None
-        for ckpt in ckpt_names:
-            if os.path.exists(os.path.join(ckpt_dir, ckpt)):
-                eval_ckpt = ckpt
-                break
-                
-        if eval_ckpt is None:
-            print("No checkpoints found for evaluation!")
-            exit()
-            
-        success_rate, avg_return = eval_bc(config, eval_ckpt, save_episode=True)
-        print(f'{eval_ckpt}: {success_rate=} {avg_return=}\n')
+        ckpt_names = [f'policy_best.ckpt']
+        results = []
+        for ckpt_name in ckpt_names:
+            success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
+            results.append([ckpt_name, success_rate, avg_return])
+
+        for ckpt_name, success_rate, avg_return in results:
+            print(f'{ckpt_name}: {success_rate=} {avg_return=}')
+        print()
         exit()
 
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
@@ -231,13 +221,12 @@ def main(args):
         pickle.dump(stats, f)
 
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
-    
-    if best_ckpt_info is not None:
-        best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-        ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
-        # Save securely so it can be evaluated or resumed later
-        torch.save({'model_state_dict': best_state_dict}, ckpt_path)
-        print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch {best_epoch}')
+    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+
+    # save best checkpoint
+    ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
+    torch.save(best_state_dict, ckpt_path)
+    print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
 
 
 def make_policy(policy_class, policy_config):
@@ -261,14 +250,13 @@ def make_optimizer(policy_class, policy):
 
 
 def get_image(ts, camera_names):
-    curr_images =[]
+    curr_images = []
     for cam_name in camera_names:
         curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
         curr_images.append(curr_image)
     curr_image = np.stack(curr_images, axis=0)
     curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
     return curr_image
-
 
 def eval_bc(config, ckpt_name, save_episode=True):
     set_seed(config['seed'])
@@ -290,14 +278,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
-    
-    # Checkpoint loading resilient to dict wrappers vs raw state dicts
-    checkpoint = torch.load(ckpt_path)
-    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        loading_status = policy.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        loading_status = policy.load_state_dict(checkpoint)
-        
+    loading_status = policy.load_state_dict(torch.load(ckpt_path))
     print(loading_status)
     policy.cuda()
     policy.eval()
@@ -340,7 +321,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
     num_rollouts = 50
     episode_returns = []
-    highest_rewards =[]
+    highest_rewards = []
     
     for rollout_id in range(num_rollouts):
         print(f"\n--- Starting Rollout {rollout_id} ---")
@@ -365,7 +346,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
             ### --- SAM 2 INITIALIZATION FOR THIS EPISODE --- ###
             if use_sam2:
                 # Assuming the primary uncropped camera is the first one in the config to track from
-                track_cam_name =[cam for cam in camera_names if 'cropped' not in cam][0] if any('cropped' not in cam for cam in camera_names) else camera_names[0]
+                track_cam_name = [cam for cam in camera_names if 'cropped' not in cam][0] if any('cropped' not in cam for cam in camera_names) else camera_names[0]
                 first_frame = ts.observation['images'][track_cam_name]
                 
                 # Prompt user to click the object
@@ -411,12 +392,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
             qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
             image_list = [] 
             qpos_list = []
-            target_qpos_list =[]
+            target_qpos_list = []
             rewards = []
             
-            attn_vis_list =[]
+            attn_vis_list = []
             curr_attn_weights = None
-            curr_box_hat = None # Retained for fallback compatability, but won't be filled with YOLO data
 
             print(f"Running evaluation (Distractor: {has_distractor})...")
             with torch.inference_mode():
@@ -469,7 +449,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     # Query policy
                     if config['policy_class'] == "ACT":
                         if t % query_frequency == 0:
-                            all_actions, curr_attn_weights = policy(qpos, curr_image, curr_image) # Inference only sends student features (duplicated here to fulfill argument footprint if not handled in wrapper)
+                            all_actions, curr_attn_weights = policy(qpos, curr_image)
                         
                         if temporal_agg:
                             all_time_actions[[t], t:t+num_queries] = all_actions
@@ -489,11 +469,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     else:
                         raise NotImplementedError
 
-                    ### --- RETAINED ATTENTION VISUALIZATION --- ###
+                    ### --- ATTENTION MAP VISUALIZATION --- ###
                     if save_episode and curr_attn_weights is not None:
                         vis_img = visualize_attention(curr_image, curr_attn_weights, camera_names)
                         attn_vis_list.append(np.uint8(vis_img * 255))
-                    ### ---------------------------------------- ###
+                    ### ----------------------------------- ###
 
                     if 'images' in obs:
                         image_list.append({k: v.copy() for k, v in obs['images'].items()})
@@ -543,7 +523,6 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     print(f"Saving attention video ({suffix}) for rollout {rollout_id}...")
                     attn_video_path = os.path.join(ckpt_dir, f'video_attn_{suffix}_{rollout_id}.mp4')
                     
-                    # NOTE: Images are ALREADY uint8 from our drawing logic above
                     attn_frames = attn_vis_list 
                     
                     h, w, _ = attn_frames[0].shape
@@ -582,234 +561,97 @@ def eval_bc(config, ckpt_name, save_episode=True):
     return success_rate, avg_return
 
 
-def forward_pass(data, policy, train_stage):
-    # Expecting: image_data_enc, image_data_dec, qpos_data, action_data, is_pad
-    image_enc, image_dec, qpos_data, action_data, is_pad = data
-    image_enc, image_dec, qpos_data, action_data, is_pad = image_enc.cuda(), image_dec.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_enc, image_dec, action_data, is_pad, train_stage=train_stage)
-
-
-def get_optimizer_stage2(policy, lr, lr_backbone, weight_decay=1e-4):
-    """Re-creates the optimizer to only update parameters that still require gradients."""
-    param_dicts = [
-        {"params":[p for n, p in policy.named_parameters() if "backbone" not in n and p.requires_grad]},
-        {
-            "params":[p for n, p in policy.named_parameters() if "backbone" in n and p.requires_grad],
-            "lr": lr_backbone,
-        },
-    ]
-    return torch.optim.AdamW(param_dicts, lr=lr, weight_decay=weight_decay)
+def forward_pass(data, policy):
+    image_data, qpos_data, action_data, is_pad = data
+    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+    return policy(qpos_data, image_data, action_data, is_pad)
 
 
 def train_bc(train_dataloader, val_dataloader, config):
-    stage_1_epochs = config['stage_1_epochs']
-    stage_2_epochs = config['stage_2_epochs']
-    total_epochs = stage_1_epochs + stage_2_epochs
-    
+    num_epochs = config['num_epochs']
     ckpt_dir = config['ckpt_dir']
     seed = config['seed']
     policy_class = config['policy_class']
     policy_config = config['policy_config']
+    resume_ckpt_path = config.get('resume_ckpt_path', None)
 
     set_seed(seed)
+
     policy = make_policy(policy_class, policy_config)
+
+    if resume_ckpt_path is not None:
+        if os.path.exists(resume_ckpt_path):
+            print(f"\n=> Resuming training from checkpoint: {resume_ckpt_path}")
+            loading_status = policy.load_state_dict(torch.load(resume_ckpt_path))
+            print(loading_status)
+        else:
+            print(f"\n[!] Warning: Resume checkpoint not found at {resume_ckpt_path}. Starting from scratch.")
+
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
 
     train_history = []
-    validation_history =[]
-    
-    # Trackers for Stage 1 & Stage 2
-    min_val_loss_s1 = np.inf
-    best_ckpt_info_s1 = None
-    min_val_loss_s2 = np.inf
-    best_ckpt_info_s2 = None
-    
-    start_epoch = 0
-    resume_ckpt = config.get('resume_ckpt', None)
-    
-    # --- RESUME LOGIC ---
-    if resume_ckpt is not None:
-        print(f"\nResuming training from checkpoint: {resume_ckpt}")
-        checkpoint = torch.load(resume_ckpt)
-        
-        # New robust checkpoint dictionaries vs raw state-dicts
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            policy.load_state_dict(checkpoint['model_state_dict'])
-            start_epoch = checkpoint.get('epoch', 0) + 1
-            min_val_loss_s1 = checkpoint.get('min_val_loss_s1', np.inf)
-            min_val_loss_s2 = checkpoint.get('min_val_loss_s2', np.inf)
-            train_history = checkpoint.get('train_history',[])
-            validation_history = checkpoint.get('validation_history',[])
-        else:
-            policy.load_state_dict(checkpoint)
-            match = re.search(r'epoch_(\d+)', resume_ckpt)
-            if match:
-                start_epoch = int(match.group(1)) + 1
-        
-        # If resuming DIRECTLY into Stage 2, setup the frozen flags & specific optimizer first
-        if start_epoch > stage_1_epochs:
-            print("Resuming directly into Stage 2. Freezing Teacher parameters...")
-            if hasattr(policy.model, 'backbones') and policy.model.backbones is not None:
-                for param in policy.model.backbones.parameters():
-                    param.requires_grad = False
-            for param in policy.model.transformer.encoder.parameters():
-                param.requires_grad = False
-                
-            optimizer = get_optimizer_stage2(
-                policy, 
-                lr=policy_config['lr'], 
-                lr_backbone=policy_config['lr_backbone']
-            )
-            
-        # Load the optimizer state AFTER potentially re-initializing it for Stage 2
-        if isinstance(checkpoint, dict) and 'optimizer_state_dict' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            
-        print(f"Successfully resumed. Starting at Epoch {start_epoch}.\n")
-
-    for epoch in tqdm(range(start_epoch, total_epochs)):
-        # Determine the current stage
-        train_stage = 1 if epoch < stage_1_epochs else 2
-        print(f'\nEpoch {epoch} | Stage {train_stage}')
-
-        # ==========================================
-        # AUTOMATIC TRANSITION LOGIC
-        # ==========================================
-        if epoch == stage_1_epochs:
-            print("\n" + "="*50)
-            print("Transitioning to Stage 2: Knowledge Distillation!")
-            print("="*50)
-            
-            # 1. Load the best Stage 1 Teacher (if available) to ensure the Student learns from the best model
-            if best_ckpt_info_s1 is not None:
-                best_epoch_s1, _, best_state_dict_s1 = best_ckpt_info_s1
-                policy.load_state_dict(best_state_dict_s1)
-                print(f"Loaded Best Stage 1 Teacher (from epoch {best_epoch_s1}).")
-            else:
-                # If we continued training and haven't cached the best state dict in RAM, attempt to pull from disk
-                ckpt_path_s1 = os.path.join(ckpt_dir, f'policy_best_stage1_seed_{seed}.ckpt')
-                if os.path.exists(ckpt_path_s1):
-                    checkpoint_s1 = torch.load(ckpt_path_s1)
-                    if isinstance(checkpoint_s1, dict) and 'model_state_dict' in checkpoint_s1:
-                        policy.load_state_dict(checkpoint_s1['model_state_dict'])
-                    else:
-                        policy.load_state_dict(checkpoint_s1)
-                    print("Loaded Best Stage 1 Teacher from disk.")
-                else:
-                    print("Warning: No Best Stage 1 Teacher found on disk! Using current weights.")
-            
-            # 2. Freeze Teacher's Backbones
-            if hasattr(policy.model, 'backbones') and policy.model.backbones is not None:
-                for param in policy.model.backbones.parameters():
-                    param.requires_grad = False
-                    
-            # 3. Freeze Teacher's Transformer Encoder
-            for param in policy.model.transformer.encoder.parameters():
-                param.requires_grad = False
-            
-            print("Teacher parameters frozen.")
-            
-            # 4. Re-initialize Optimizer for Student parameters only
-            optimizer = get_optimizer_stage2(
-                policy, 
-                lr=policy_config['lr'], 
-                lr_backbone=policy_config['lr_backbone']
-            )
-            print("Stage 2 Optimizer initialized.")
-
-        # ==========================================
-        # VALIDATION
-        # ==========================================
+    validation_history = []
+    min_val_loss = np.inf
+    best_ckpt_info = None
+    for epoch in tqdm(range(num_epochs)):
+        print(f'\nEpoch {epoch}')
+        # validation
         with torch.inference_mode():
             policy.eval()
-            epoch_dicts =[]
+            epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
-                forward_dict = forward_pass(data, policy, train_stage=train_stage)
+                forward_dict = forward_pass(data, policy)
                 epoch_dicts.append(forward_dict)
-            
             epoch_summary = compute_dict_mean(epoch_dicts)
             validation_history.append(epoch_summary)
-            epoch_val_loss = epoch_summary['loss']
-            
-            # Track best models depending on the stage and save immediately to disk to prevent data loss
-            if train_stage == 1:
-                if epoch_val_loss < min_val_loss_s1:
-                    min_val_loss_s1 = epoch_val_loss
-                    best_ckpt_info_s1 = (epoch, min_val_loss_s1, deepcopy(policy.state_dict()))
-                    torch.save({'model_state_dict': best_ckpt_info_s1[2]}, os.path.join(ckpt_dir, f'policy_best_stage1_seed_{seed}.ckpt'))
-            else:
-                if epoch_val_loss < min_val_loss_s2:
-                    min_val_loss_s2 = epoch_val_loss
-                    best_ckpt_info_s2 = (epoch, min_val_loss_s2, deepcopy(policy.state_dict()))
-                    torch.save({'model_state_dict': best_ckpt_info_s2[2]}, os.path.join(ckpt_dir, f'policy_best_stage2_seed_{seed}.ckpt'))
 
-        print(f'\n Val loss:   {epoch_val_loss:.5f}')
+            epoch_val_loss = epoch_summary['loss']
+            if epoch_val_loss < min_val_loss:
+                min_val_loss = epoch_val_loss
+                best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
+        print(f'Val loss:   {epoch_val_loss:.5f}')
         summary_string = ''
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
 
-        # ==========================================
-        # TRAINING
-        # ==========================================
+        # training
         policy.train()
         optimizer.zero_grad()
-        
-        # Use starting index for robustness when resuming
-        epoch_start_idx = len(train_history)
         for batch_idx, data in enumerate(train_dataloader):
-            forward_dict = forward_pass(data, policy, train_stage=train_stage)
+            forward_dict = forward_pass(data, policy)
+            # backward
             loss = forward_dict['loss']
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             train_history.append(detach_dict(forward_dict))
-            
-        epoch_summary = compute_dict_mean(train_history[epoch_start_idx:])
+        epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
-        print(f'\n Train loss: {epoch_train_loss:.5f}')
+        print(f'Train loss: {epoch_train_loss:.5f}')
         summary_string = ''
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
 
-        # Save checkpoints periodically with everything needed for a safe resume
-        if epoch % 400 == 0:
+        if epoch % 100 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
-            save_dict = {
-                'epoch': epoch,
-                'model_state_dict': policy.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'min_val_loss_s1': min_val_loss_s1,
-                'min_val_loss_s2': min_val_loss_s2,
-                'train_history': train_history,
-                'validation_history': validation_history,
-            }
-            torch.save(save_dict, ckpt_path)
-            # Use 'epoch + 1' for safe matplotlib boundaries during active training
-            plot_history(train_history, validation_history, epoch + 1, ckpt_dir, seed)
+            torch.save(policy.state_dict(), ckpt_path)
+            plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
-    # ==========================================
-    # FINALIZE & SAVE
-    # ==========================================
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
-    save_dict = {
-        'epoch': total_epochs - 1,
-        'model_state_dict': policy.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'min_val_loss_s1': min_val_loss_s1,
-        'min_val_loss_s2': min_val_loss_s2,
-        'train_history': train_history,
-        'validation_history': validation_history,
-    }
-    torch.save(save_dict, ckpt_path)
+    torch.save(policy.state_dict(), ckpt_path)
 
-    # Note: Best Stage 1 and Stage 2 are heavily saved incrementally now.
-    plot_history(train_history, validation_history, total_epochs, ckpt_dir, seed)
+    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+    ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
+    torch.save(best_state_dict, ckpt_path)
+    print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
 
-    # Return the final best student model (fallback to stage 1 if stage 2 wasn't run)
-    return best_ckpt_info_s2 if stage_2_epochs > 0 else best_ckpt_info_s1
+    # save training curves
+    plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
+
+    return best_ckpt_info
 
 
 def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
@@ -838,11 +680,7 @@ if __name__ == '__main__':
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
     parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
-    
-    # Replaced --num_epochs with two stages:
-    parser.add_argument('--stage_1_epochs', action='store', type=int, help='Epochs to train Teacher', default=400)
-    parser.add_argument('--stage_2_epochs', action='store', type=int, help='Epochs to train Student via distillation', default=400)
-    
+    parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
 
     # for ACT
@@ -851,8 +689,8 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
-    
-    # Continue Training argument
-    parser.add_argument('--resume_ckpt', action='store', type=str, help='Path to an exact checkpoint to resume training from', default=None)
+    parser.add_argument('--fusion_type', action='store', type=int, default=1, 
+                        help='0: concat, 1: cam0->cam1, 2: cam1->cam0, 3: bi-directional')
+    parser.add_argument('--resume_ckpt_path', action='store', type=str, help='Path to a checkpoint to resume training from', required=False)
     
     main(vars(parser.parse_args()))
