@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import pickle
 import argparse
 import matplotlib.pyplot as plt
@@ -747,7 +748,9 @@ def train_bc(train_dataloader, val_dataloader, config):
         print(f'\n Val loss:   {epoch_val_loss:.5f}')
         summary_string = ''
         for k, v in epoch_summary.items():
-            summary_string += f'{k}: {v.item():.3f} '
+            # FIX: Only call .item() if the value is actually a tensor
+            val = v.item() if hasattr(v, 'item') else v
+            summary_string += f'{k}: {val:.3f} '
         print(summary_string)
 
         # ==========================================
@@ -764,14 +767,18 @@ def train_bc(train_dataloader, val_dataloader, config):
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            train_history.append(detach_dict(forward_dict))
+            # train_history.append(detach_dict(forward_dict))
+            safe_dict = {k: v.item() if hasattr(v, 'item') else v for k, v in forward_dict.items()}
+            train_history.append(safe_dict)
             
         epoch_summary = compute_dict_mean(train_history[epoch_start_idx:])
         epoch_train_loss = epoch_summary['loss']
         print(f'\n Train loss: {epoch_train_loss:.5f}')
         summary_string = ''
         for k, v in epoch_summary.items():
-            summary_string += f'{k}: {v.item():.3f} '
+            # FIX: Only call .item() if the value is actually a tensor
+            val = v.item() if hasattr(v, 'item') else v
+            summary_string += f'{k}: {val:.3f} '
         print(summary_string)
 
         # Save checkpoints periodically with everything needed for a safe resume
@@ -811,14 +818,14 @@ def train_bc(train_dataloader, val_dataloader, config):
     # Return the final best student model (fallback to stage 1 if stage 2 wasn't run)
     return best_ckpt_info_s2 if stage_2_epochs > 0 else best_ckpt_info_s1
 
-
 def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
     # save training curves
     for key in train_history[0]:
         plot_path = os.path.join(ckpt_dir, f'train_val_{key}_seed_{seed}.png')
         plt.figure()
-        train_values = [summary[key].item() for summary in train_history]
-        val_values = [summary[key].item() for summary in validation_history]
+        # FIX: Check for .item() in list comprehensions
+        train_values = [summary[key].item() if hasattr(summary[key], 'item') else summary[key] for summary in train_history]
+        val_values = [summary[key].item() if hasattr(summary[key], 'item') else summary[key] for summary in validation_history]
         plt.plot(np.linspace(0, num_epochs-1, len(train_history)), train_values, label='train')
         plt.plot(np.linspace(0, num_epochs-1, len(validation_history)), val_values, label='validation')
         # plt.ylim([-0.1, 1])
@@ -840,8 +847,8 @@ if __name__ == '__main__':
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
     
     # Replaced --num_epochs with two stages:
-    parser.add_argument('--stage_1_epochs', action='store', type=int, help='Epochs to train Teacher', default=400)
-    parser.add_argument('--stage_2_epochs', action='store', type=int, help='Epochs to train Student via distillation', default=400)
+    parser.add_argument('--stage_1_epochs', action='store', type=int, help='Epochs to train Teacher', default=4000)
+    parser.add_argument('--stage_2_epochs', action='store', type=int, help='Epochs to train Student via distillation', default=4000)
     
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
 
@@ -853,6 +860,6 @@ if __name__ == '__main__':
     parser.add_argument('--temporal_agg', action='store_true')
     
     # Continue Training argument
-    parser.add_argument('--resume_ckpt', action='store', type=str, help='Path to an exact checkpoint to resume training from', default=None)
+    parser.add_argument('--resume_ckpt', action='store', type=str, help='Path to an exact checkpoint to resume training from', default='/mnt/Ego2Exo/checkpoints/checkpoints_student/policy_epoch_4400_seed_10.ckpt')
     
     main(vars(parser.parse_args()))
