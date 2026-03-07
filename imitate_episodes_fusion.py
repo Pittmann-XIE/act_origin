@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import pickle
 import argparse
 import matplotlib.pyplot as plt
@@ -75,11 +75,12 @@ def get_square_crop(raw_frame, mask, padding=10, target_size=(640, 480)):
         
     return cv2.resize(crop, target_size)
 
-def visualize_attention(curr_image, attn_weights, camera_names):
+def visualize_attention(curr_image, attn_weights, camera_names, fusion_type=0):
     """
     Overlay attention map on the current image.
     curr_image: Tensor (1, num_cameras, C, H, W)
     attn_weights: Tensor (1, num_queries, seq_len)
+    fusion_type: int, determines the meaning of the attention sequence
     """
     # 1. Process Images
     curr_images_np = curr_image.detach().cpu().numpy().squeeze(0).transpose(0, 2, 3, 1)
@@ -97,36 +98,68 @@ def visualize_attention(curr_image, attn_weights, camera_names):
     num_cams = len(camera_names)
     h_feat, w_feat = 15, 20
     
-    # Because detr_vae.py concatenates along width (axis=3), the flattened sequence
-    # represents a combined wide image of size (h_feat, w_feat * num_cams).
-    # We must reshape it to this wide format first!
-    combined_attn_2d = attn_map.reshape((h_feat, w_feat * num_cams))
-    
     vis_images = []
     
-    for cam_idx in range(num_cams):
-        # Crop the specific camera's attention map out of the combined wide map
-        start_col = cam_idx * w_feat
-        end_col = (cam_idx + 1) * w_feat
-        cam_attn_2d = combined_attn_2d[:, start_col:end_col]
+    # CASE A: Directed Cross-Attention (Single Stream Output)
+    if fusion_type in [1, 2]:
+        cam_attn_2d = attn_map.reshape((h_feat, w_feat))
         
         # Normalize attention map 0-1
-        cam_attn_2d = cam_attn_2d - cam_attn_2d.min()
-        cam_attn_2d = cam_attn_2d / (cam_attn_2d.max() + 1e-8)
+        cam_attn_norm = cam_attn_2d - cam_attn_2d.min()
+        cam_attn_norm = cam_attn_norm / (cam_attn_norm.max() + 1e-8)
         
-        # Resize to original image size
-        img_h, img_w = curr_images_np[cam_idx].shape[:2]
-        cam_attn_resized = cv2.resize(cam_attn_2d, (img_w, img_h))
+        for cam_idx in range(num_cams):
+            original_img = curr_images_np[cam_idx]
+            
+            # fusion_type=1 -> cam0 is query; fusion_type=2 -> cam1 is query
+            is_query_cam = (fusion_type == 1 and cam_idx == 0) or (fusion_type == 2 and cam_idx == 1)
+            
+            if is_query_cam:
+                # Resize to original image size and apply Colormap
+                img_h, img_w = original_img.shape[:2]
+                cam_attn_resized = cv2.resize(cam_attn_norm, (img_w, img_h))
+                
+                heatmap = cv2.applyColorMap(np.uint8(255 * cam_attn_resized), cv2.COLORMAP_JET)
+                heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
+                
+                # Overlay: 60% Image, 40% Heatmap
+                overlayed_img = 0.6 * original_img + 0.4 * heatmap
+            else:
+                # Do not apply heatmap to the key/value camera; just show the raw image
+                # (Optional: you could dim it slightly by multiplying by 0.7 to emphasize the active camera)
+                overlayed_img = original_img
+                
+            vis_images.append(overlayed_img)
+
+    # CASE B: Concatenated Features (Bi-directional or No Fusion)
+    elif fusion_type in [0, 3]:
+        combined_attn_2d = attn_map.reshape((h_feat, w_feat * num_cams))
         
-        # Apply Colormap (JET)
-        heatmap = cv2.applyColorMap(np.uint8(255 * cam_attn_resized), cv2.COLORMAP_JET)
-        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
-        
-        # Overlay: 60% Image, 40% Heatmap
-        original_img = curr_images_np[cam_idx]
-        overlayed_img = 0.6 * original_img + 0.4 * heatmap
-        
-        vis_images.append(overlayed_img)
+        for cam_idx in range(num_cams):
+            # Crop the specific camera's attention map out of the combined wide map
+            start_col = cam_idx * w_feat
+            end_col = (cam_idx + 1) * w_feat
+            cam_attn_2d = combined_attn_2d[:, start_col:end_col]
+            
+            # Normalize attention map 0-1
+            cam_attn_norm = cam_attn_2d - cam_attn_2d.min()
+            cam_attn_norm = cam_attn_norm / (cam_attn_norm.max() + 1e-8)
+            
+            # Resize and apply Colormap
+            img_h, img_w = curr_images_np[cam_idx].shape[:2]
+            cam_attn_resized = cv2.resize(cam_attn_norm, (img_w, img_h))
+            
+            heatmap = cv2.applyColorMap(np.uint8(255 * cam_attn_resized), cv2.COLORMAP_JET)
+            heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
+            
+            # Overlay: 60% Image, 40% Heatmap
+            original_img = curr_images_np[cam_idx]
+            overlayed_img = 0.6 * original_img + 0.4 * heatmap
+            
+            vis_images.append(overlayed_img)
+            
+    else:
+        raise ValueError(f"Unknown fusion_type: {fusion_type}")
         
     # Concatenate cameras horizontally
     return np.concatenate(vis_images, axis=1)
@@ -473,7 +506,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
                     ### --- ATTENTION MAP VISUALIZATION --- ###
                     if save_episode and curr_attn_weights is not None:
-                        vis_img = visualize_attention(curr_image, curr_attn_weights, camera_names)
+                        current_fusion_type = config['policy_config'].get('fusion_type', 0)
+                        vis_img = visualize_attention(curr_image, curr_attn_weights, camera_names, current_fusion_type)
                         attn_vis_list.append(np.uint8(vis_img * 255))
                     ### ----------------------------------- ###
 
@@ -691,7 +725,7 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
-    parser.add_argument('--fusion_type', action='store', type=int, default=3, 
+    parser.add_argument('--fusion_type', action='store', type=int, default=1, 
                         help='0: concat, 1: cam0->cam1, 2: cam1->cam0, 3: bi-directional')
     parser.add_argument('--fusion_layers', action='store', type=int, default=3, help='Number of cross-attention fusion layers')
     parser.add_argument('--resume_ckpt_path', action='store', type=str, help='Path to a checkpoint to resume training from', required=False)
