@@ -10,10 +10,10 @@ from einops import rearrange
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
-from utils_encoder import load_data # data functions
-from utils_encoder import sample_box_pose, sample_insertion_pose # robot functions
-from utils_encoder import compute_dict_mean, set_seed, detach_dict # helper functions
-from policy_encoder import ACTPolicy, CNNMLPPolicy
+from utils_student import load_data # data functions
+from utils_student import sample_box_pose, sample_insertion_pose # robot functions
+from utils_student import compute_dict_mean, set_seed, detach_dict # helper functions
+from policy_student import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
 
 # Import the new ENABLE_DISTRACTOR flag
@@ -22,10 +22,58 @@ from sim_env import BOX_POSE, ENABLE_DISTRACTOR
 import IPython
 e = IPython.embed
 
-import matplotlib.pyplot as plt
 import cv2
 
-def visualize_attention(curr_image, attn_weights, camera_names_encoder):
+try:
+    from sam2.build_sam import build_sam2_video_predictor
+except ImportError as e:
+    print("Error importing SAM 2.1 predictor. Please ensure the SAM repository is correctly set up and the path is correct.")
+
+def get_user_click(image_rgb):
+    """Displays the first frame and waits for the user to click the object."""
+    print("Please click on the object to track, then close the window.")
+    plt.imshow(image_rgb)
+    # ginput(1) gets one click. timeout=0 means it waits forever.
+    clicked_points = plt.ginput(1, timeout=0) 
+    plt.close()
+    
+    if not clicked_points:
+        raise ValueError("No click detected! Please click the object.")
+    
+    # Return as [x, y]
+    return [int(clicked_points[0][0]), int(clicked_points[0][1])]
+
+def get_square_crop(raw_frame, mask, padding=10, target_size=(640, 480)):
+    """Extracts a square crop based on the mask and resizes to target_size."""
+    img_h, img_w, _ = raw_frame.shape
+    y_indices, x_indices = np.where(mask > 0)
+    
+    if len(y_indices) == 0 or len(x_indices) == 0:
+        return cv2.resize(raw_frame, target_size) # Fallback if tracking fails
+        
+    x_min_t = max(0, x_indices.min() - padding)
+    x_max_t = min(img_w - 1, x_indices.max() + padding)
+    y_min_t = max(0, y_indices.min() - padding)
+    y_max_t = min(img_h - 1, y_indices.max() + padding)
+    
+    # Create a SQUARE crop (Aspect Ratio Preservation)
+    side = max(x_max_t - x_min_t, y_max_t - y_min_t)
+    cx, cy = (x_min_t + x_max_t) / 2, (y_min_t + y_max_t) / 2
+    
+    x_min_s = int(max(0, cx - side / 2))
+    x_max_s = int(min(img_w - 1, cx + side / 2))
+    y_min_s = int(max(0, cy - side / 2))
+    y_max_s = int(min(img_h - 1, cy + side / 2))
+    
+    crop = raw_frame[y_min_s:y_max_s, x_min_s:x_max_s]
+    
+    # Handle edge cases where the crop is empty (e.g., object leaves frame)
+    if crop.size == 0:
+        return cv2.resize(raw_frame, target_size)
+        
+    return cv2.resize(crop, target_size)
+
+def visualize_attention(curr_image, attn_weights, camera_names):
     """
     Overlay attention map on the current image.
     curr_image: Tensor (1, num_cameras, C, H, W)
@@ -44,7 +92,7 @@ def visualize_attention(curr_image, attn_weights, camera_names_encoder):
     # ACT adds 2 extra tokens (latent_input and proprio_input) at the front
     attn_map = attn_map[2:] 
     
-    num_cams = len(camera_names_encoder)
+    num_cams = len(camera_names)
     h_feat, w_feat = 15, 20
     
     # Because detr_vae.py concatenates along width (axis=3), the flattened sequence
@@ -52,7 +100,7 @@ def visualize_attention(curr_image, attn_weights, camera_names_encoder):
     # We must reshape it to this wide format first!
     combined_attn_2d = attn_map.reshape((h_feat, w_feat * num_cams))
     
-    vis_images =[]
+    vis_images = []
     
     for cam_idx in range(num_cams):
         # Crop the specific camera's attention map out of the combined wide map
@@ -91,7 +139,10 @@ def main(args):
     task_name = args['task_name']
     batch_size_train = args['batch_size']
     batch_size_val = args['batch_size']
-    num_epochs = args['num_epochs']
+    
+    # Automatically switch epochs based on stage arguments
+    stage_1_epochs = args.get('stage_1_epochs', 0)
+    stage_2_epochs = args.get('stage_2_epochs', 0)
 
     # get task parameters
     is_sim = task_name[:4] == 'sim_'
@@ -104,8 +155,7 @@ def main(args):
     dataset_dir = task_config['dataset_dir']
     num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
-    camera_names_encoder = task_config['camera_names_encoder']
-    camera_names_decoder = task_config['camera_names_decoder']
+    camera_names = task_config['camera_names']
 
     # fixed parameters
     state_dim = 14
@@ -125,18 +175,17 @@ def main(args):
                          'enc_layers': enc_layers,
                          'dec_layers': dec_layers,
                          'nheads': nheads,
-                         'camera_names_encoder': camera_names_encoder,
-                         'camera_names_decoder': camera_names_decoder,
-                         'box_weight': 0.5
+                         'camera_names': camera_names,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names_encoder': camera_names_encoder, 'camera_names_decoder': camera_names_decoder}
+                         'camera_names': camera_names,}
     else:
         raise NotImplementedError
 
     config = {
-        'num_epochs': num_epochs,
+        'stage_1_epochs': stage_1_epochs,
+        'stage_2_epochs': stage_2_epochs,
         'ckpt_dir': ckpt_dir,
         'episode_len': episode_len,
         'state_dim': state_dim,
@@ -147,24 +196,30 @@ def main(args):
         'task_name': task_name,
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
-        'camera_names_encoder': camera_names_encoder,
-        'camera_names_decoder': camera_names_decoder,
+        'camera_names': camera_names,
         'real_robot': not is_sim
     }
 
     if is_eval:
-        ckpt_names = [f'policy_best.ckpt']
-        results =[]
-        for ckpt_name in ckpt_names:
-            success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
-            results.append([ckpt_name, success_rate, avg_return])
-
-        for ckpt_name, success_rate, avg_return in results:
-            print(f'{ckpt_name}: {success_rate=} {avg_return=}')
-        print()
+        # Load best student checkpoint by default for evaluation
+        ckpt_names = [f'policy_best_stage2_seed_{args["seed"]}.ckpt', f'policy_best.ckpt']
+        
+        # Determine which checkpoint actually exists
+        eval_ckpt = None
+        for ckpt in ckpt_names:
+            if os.path.exists(os.path.join(ckpt_dir, ckpt)):
+                eval_ckpt = ckpt
+                break
+                
+        if eval_ckpt is None:
+            print("No checkpoints found for evaluation!")
+            exit()
+            
+        success_rate, avg_return = eval_bc(config, eval_ckpt, save_episode=True)
+        print(f'{eval_ckpt}: {success_rate=} {avg_return=}\n')
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names_encoder, camera_names_decoder, batch_size_train, batch_size_val)
+    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -174,12 +229,12 @@ def main(args):
         pickle.dump(stats, f)
 
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
-    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-
-    # save best checkpoint
-    ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
-    torch.save(best_state_dict, ckpt_path)
-    print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
+    
+    if best_ckpt_info is not None:
+        best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+        ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
+        torch.save(best_state_dict, ckpt_path)
+        print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch {best_epoch}')
 
 
 def make_policy(policy_class, policy_config):
@@ -202,16 +257,15 @@ def make_optimizer(policy_class, policy):
     return optimizer
 
 
-def get_image(ts, camera_names_encoder, camera_names_decoder):
-    def _extract_cams(cam_names):
-        curr_images =[]
-        for cam_name in cam_names:
-            curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
-            curr_images.append(curr_image)
-        curr_image = np.stack(curr_images, axis=0)
-        return torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
+def get_image(ts, camera_names):
+    curr_images = []
+    for cam_name in camera_names:
+        curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
+        curr_images.append(curr_image)
+    curr_image = np.stack(curr_images, axis=0)
+    curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
+    return curr_image
 
-    return _extract_cams(camera_names_encoder), _extract_cams(camera_names_decoder)
 
 def eval_bc(config, ckpt_name, save_episode=True):
     set_seed(config['seed'])
@@ -221,12 +275,14 @@ def eval_bc(config, ckpt_name, save_episode=True):
     policy_class = config['policy_class']
     onscreen_render = config['onscreen_render']
     policy_config = config['policy_config']
-    camera_names_encoder = config['camera_names_encoder']
-    camera_names_decoder = config['camera_names_decoder']
+    camera_names = config['camera_names']
     max_timesteps = config['episode_len']
     task_name = config['task_name']
     temporal_agg = config['temporal_agg']
     onscreen_cam = 'angle'
+
+    # Check if SAM 2 is needed based on camera names containing 'cropped'
+    use_sam2 = any('cropped' in cam for cam in camera_names)
 
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
@@ -243,6 +299,17 @@ def eval_bc(config, ckpt_name, save_episode=True):
     pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
     post_process = lambda a: a * stats['action_std'] + stats['action_mean']
     
+    # 1. Initialize SAM 2 Small conditionally
+    if use_sam2:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        sam2_predictor = build_sam2_video_predictor(
+            "configs/sam2.1/sam2.1_hiera_s.yaml", # SMALL MODEL
+            "/home/pengtao/ws_ros2humble-main_lab/sam2/checkpoints/sam2.1_hiera_small.pt", 
+            device=device
+        )
+    else:
+        sam2_predictor = None
+
     # load environment
     if real_robot:
         from aloha_scripts.robot_utils import move_grippers # requires aloha
@@ -263,7 +330,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
     num_rollouts = 50
     episode_returns = []
-    highest_rewards =[]
+    highest_rewards = []
     
     for rollout_id in range(num_rollouts):
         print(f"\n--- Starting Rollout {rollout_id} ---")
@@ -285,6 +352,43 @@ def eval_bc(config, ckpt_name, save_episode=True):
             
             ts = env.reset()
 
+            ### --- SAM 2 INITIALIZATION FOR THIS EPISODE --- ###
+            if use_sam2:
+                # Assuming the primary uncropped camera is the first one in the config to track from
+                track_cam_name = [cam for cam in camera_names if 'cropped' not in cam][0] if any('cropped' not in cam for cam in camera_names) else camera_names[0]
+                first_frame = ts.observation['images'][track_cam_name]
+                
+                # Prompt user to click the object
+                print(f"Waiting for user to click object in {track_cam_name}...")
+                click_pt = get_user_click(first_frame)
+                
+                # Use the Process ID (PID) to create a unique directory path
+                video_dir = f"/tmp/sam2_temp_rollout_{os.getpid()}"
+                os.makedirs(video_dir, exist_ok=True)
+                
+                # Clear old frames from this specific instance to avoid confusion
+                for f in os.listdir(video_dir):
+                    os.remove(os.path.join(video_dir, f))
+                
+                # Save the first frame as 00000.jpg
+                cv2.imwrite(os.path.join(video_dir, "00000.jpg"), cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
+                
+                # Offload video and state to CPU to save massive amounts of GPU VRAM
+                inference_state = sam2_predictor.init_state(
+                    video_path=video_dir,
+                    offload_video_to_cpu=True,
+                    offload_state_to_cpu=True
+                )
+                
+                sam2_predictor.add_new_points(
+                    inference_state=inference_state,
+                    frame_idx=0,
+                    obj_id=1,
+                    points=np.array([click_pt], dtype=np.float32),
+                    labels=np.array([1], np.int32)
+                )
+            ### --------------------------------------------- ###
+
             ### onscreen render setup
             if onscreen_render:
                 ax = plt.subplot()
@@ -295,16 +399,16 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
 
             qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
-            image_list =[] 
+            image_list = [] 
             qpos_list = []
             target_qpos_list = []
-            rewards =[]
+            rewards = []
             
-            attn_vis_list =[]
+            attn_vis_list = []
             curr_attn_weights = None
+            curr_box_hat = None # Retained for fallback compatability, but won't be filled with YOLO data
 
             print(f"Running evaluation (Distractor: {has_distractor})...")
-            
             with torch.inference_mode():
                 for t in range(max_timesteps):
                     if onscreen_render:
@@ -313,28 +417,49 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         plt.pause(DT)
 
                     obs = ts.observation
-
-                    if 'images' in obs:
-                        image_list.append({k: v.copy() for k, v in obs['images'].items()})
-                    else:
-                        image_list.append({'main': obs['image']})
+                    
+                   ### --- FIXED SAM 2 TRACKING & CROPPING --- ###
+                    if use_sam2:
+                        current_frame = obs['images'][track_cam_name]
+                        
+                        if t > 0:
+                            img_resized = cv2.resize(
+                                current_frame, 
+                                (sam2_predictor.image_size, sam2_predictor.image_size)
+                            )
+                            img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
+                            img_tensor = img_tensor.unsqueeze(0).cpu()
+                            inference_state["images"] = torch.cat([inference_state["images"], img_tensor], dim=0)
+                            inference_state["num_frames"] = inference_state["images"].shape[0]
+                        
+                        mask = None
+                        for out_frame_idx, out_obj_ids, out_mask_logits in sam2_predictor.propagate_in_video(
+                            inference_state, 
+                            start_frame_idx=t, 
+                            max_frame_num_to_track=1
+                        ):
+                            mask = (out_mask_logits[0] > 0.0).cpu().numpy().squeeze()
+                        
+                        if mask is not None:
+                            cropped_img = get_square_crop(current_frame, mask, padding=10, target_size=(640, 480))
+                        else:
+                            cropped_img = cv2.resize(current_frame, (640, 480))
+                        
+                        crop_cam_target = [cam for cam in camera_names if 'cropped' in cam][0]
+                        obs['images'][crop_cam_target] = cropped_img
+                    ### --------------------------------------- ###
                         
                     qpos_numpy = np.array(obs['qpos'])
                     qpos = pre_process(qpos_numpy)
                     qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
                     qpos_history[:, t] = qpos
                     
-                    # FETCH BOTH ENCODER AND DECODER IMAGES
-                    curr_image_enc, curr_image_dec = get_image(
-                        ts, 
-                        camera_names_encoder=camera_names_encoder, 
-                        camera_names_decoder=camera_names_decoder
-                    )
+                    curr_image = get_image(ts, camera_names)
 
-                    # Query policy with both images and unpack box_hat
+                    # Query policy
                     if config['policy_class'] == "ACT":
                         if t % query_frequency == 0:
-                            all_actions, curr_attn_weights, box_hat = policy(qpos, curr_image_enc, curr_image_dec)
+                            all_actions, curr_attn_weights = policy(qpos, curr_image, curr_image) # Inference only sends student features (duplicated here to fulfill argument footprint if not handled in wrapper)
                         
                         if temporal_agg:
                             all_time_actions[[t], t:t+num_queries] = all_actions
@@ -349,10 +474,21 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         else:
                             raw_action = all_actions[:, t % query_frequency]
                     elif config['policy_class'] == "CNNMLP":
-                        raw_action = policy(qpos, curr_image_enc, curr_image_dec)
+                        raw_action = policy(qpos, curr_image)
                         curr_attn_weights = None
                     else:
                         raise NotImplementedError
+
+                    ### --- RETAINED ATTENTION VISUALIZATION --- ###
+                    if save_episode and curr_attn_weights is not None:
+                        vis_img = visualize_attention(curr_image, curr_attn_weights, camera_names)
+                        attn_vis_list.append(np.uint8(vis_img * 255))
+                    ### ---------------------------------------- ###
+
+                    if 'images' in obs:
+                        image_list.append({k: v.copy() for k, v in obs['images'].items()})
+                    else:
+                        image_list.append({'main': obs['image']})
 
                     # Post-process actions
                     raw_action = raw_action.squeeze(0).cpu().numpy()
@@ -365,16 +501,6 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     qpos_list.append(qpos_numpy)
                     target_qpos_list.append(target_qpos)
                     rewards.append(ts.reward)
-                    
-                    # Process Attention Visualization using the Decoder images/cameras
-                    if save_episode and curr_attn_weights is not None:
-                        # Note: We pass curr_image_dec and camera_names_decoder here!
-                        vis_img = visualize_attention(
-                            curr_image_dec, 
-                            curr_attn_weights, 
-                            camera_names_encoder=camera_names_decoder # Argument might be named 'encoder', but we feed decoder cams
-                        )
-                        attn_vis_list.append(vis_img)
 
                 if onscreen_render:
                     plt.close()
@@ -407,7 +533,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     print(f"Saving attention video ({suffix}) for rollout {rollout_id}...")
                     attn_video_path = os.path.join(ckpt_dir, f'video_attn_{suffix}_{rollout_id}.mp4')
                     
-                    attn_frames =[np.uint8(frame * 255) for frame in attn_vis_list]
+                    # NOTE: Images are ALREADY uint8 from our drawing logic above
+                    attn_frames = attn_vis_list 
+                    
                     h, w, _ = attn_frames[0].shape
                     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                     out = cv2.VideoWriter(attn_video_path, fourcc, int(1/DT), (w, h))
@@ -416,8 +544,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                     
                     out.release()
-                torch.cuda.empty_cache()
-                                  
+                
+                # Cleanup SAM 2 inference state at the end of every episode loop 
+                if use_sam2:
+                    sam2_predictor.reset_state(inference_state)
+                    del inference_state
+                    torch.cuda.empty_cache()
+
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
     summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'
@@ -439,92 +572,170 @@ def eval_bc(config, ckpt_name, save_episode=True):
     return success_rate, avg_return
 
 
-def forward_pass(data, policy):
-    if len(data) == 6:
-        image_encoder, image_decoder, qpos_data, action_data, is_pad, box_data = data
-        image_encoder, image_decoder, qpos_data, action_data, is_pad, box_data = image_encoder.cuda(), image_decoder.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda(), box_data.cuda()
-        return policy(qpos_data, image_encoder, image_decoder, action_data, is_pad, box_data=None)
-    else: # Fallback just in case
-        image_encoder, image_decoder, qpos_data, action_data, is_pad = data
-        image_encoder, image_decoder, qpos_data, action_data, is_pad = image_encoder.cuda(), image_decoder.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-        return policy(qpos_data, image_encoder, image_decoder, action_data, is_pad)
+def forward_pass(data, policy, train_stage):
+    # Expecting: image_data_enc, image_data_dec, qpos_data, action_data, is_pad
+    image_enc, image_dec, qpos_data, action_data, is_pad = data
+    image_enc, image_dec, qpos_data, action_data, is_pad = image_enc.cuda(), image_dec.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+    return policy(qpos_data, image_enc, image_dec, action_data, is_pad, train_stage=train_stage)
+
+
+def get_optimizer_stage2(policy, lr, lr_backbone, weight_decay=1e-4):
+    """Re-creates the optimizer to only update parameters that still require gradients."""
+    param_dicts = [
+        {"params": [p for n, p in policy.named_parameters() if "backbone" not in n and p.requires_grad]},
+        {
+            "params": [p for n, p in policy.named_parameters() if "backbone" in n and p.requires_grad],
+            "lr": lr_backbone,
+        },
+    ]
+    return torch.optim.AdamW(param_dicts, lr=lr, weight_decay=weight_decay)
 
 
 def train_bc(train_dataloader, val_dataloader, config):
-    num_epochs = config['num_epochs']
+    stage_1_epochs = config['stage_1_epochs']
+    stage_2_epochs = config['stage_2_epochs']
+    total_epochs = stage_1_epochs + stage_2_epochs
+    
     ckpt_dir = config['ckpt_dir']
     seed = config['seed']
     policy_class = config['policy_class']
     policy_config = config['policy_config']
 
     set_seed(seed)
-
     policy = make_policy(policy_class, policy_config)
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
 
     train_history = []
-    validation_history =[]
-    min_val_loss = np.inf
-    best_ckpt_info = None
-    for epoch in tqdm(range(num_epochs)):
-        print(f'\nEpoch {epoch}')
-        # validation
+    validation_history = []
+    
+    # Trackers for Stage 1
+    min_val_loss_s1 = np.inf
+    best_ckpt_info_s1 = None
+    
+    # Trackers for Stage 2
+    min_val_loss_s2 = np.inf
+    best_ckpt_info_s2 = None
+
+    for epoch in tqdm(range(total_epochs)):
+        # Determine the current stage
+        train_stage = 1 if epoch < stage_1_epochs else 2
+        print(f'\nEpoch {epoch} | Stage {train_stage}')
+
+        # ==========================================
+        # AUTOMATIC TRANSITION LOGIC
+        # ==========================================
+        if epoch == stage_1_epochs:
+            print("\n" + "="*50)
+            print("Transitioning to Stage 2: Knowledge Distillation!")
+            print("="*50)
+            
+            # 1. Load the best Stage 1 Teacher (if available) to ensure the Student learns from the best model
+            if best_ckpt_info_s1 is not None:
+                best_epoch_s1, _, best_state_dict_s1 = best_ckpt_info_s1
+                policy.load_state_dict(best_state_dict_s1)
+                print(f"Loaded Best Stage 1 Teacher (from epoch {best_epoch_s1}).")
+            
+            # 2. Freeze Teacher's Backbones
+            if hasattr(policy.model, 'backbones') and policy.model.backbones is not None:
+                for param in policy.model.backbones.parameters():
+                    param.requires_grad = False
+                    
+            # 3. Freeze Teacher's Transformer Encoder
+            for param in policy.model.transformer.encoder.parameters():
+                param.requires_grad = False
+            
+            print("Teacher parameters frozen.")
+            
+            # 4. Re-initialize Optimizer for Student parameters only
+            optimizer = get_optimizer_stage2(
+                policy, 
+                lr=policy_config['lr'], 
+                lr_backbone=policy_config['lr_backbone']
+            )
+            print("Stage 2 Optimizer initialized.")
+
+        # ==========================================
+        # VALIDATION
+        # ==========================================
         with torch.inference_mode():
             policy.eval()
-            epoch_dicts =[]
+            epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
-                forward_dict = forward_pass(data, policy)
+                forward_dict = forward_pass(data, policy, train_stage=train_stage)
                 epoch_dicts.append(forward_dict)
+            
             epoch_summary = compute_dict_mean(epoch_dicts)
             validation_history.append(epoch_summary)
-
             epoch_val_loss = epoch_summary['loss']
-            if epoch_val_loss < min_val_loss:
-                min_val_loss = epoch_val_loss
-                best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
-        print(f'Val loss:   {epoch_val_loss:.5f}')
+            
+            # Track best models depending on the stage
+            if train_stage == 1:
+                if epoch_val_loss < min_val_loss_s1:
+                    min_val_loss_s1 = epoch_val_loss
+                    best_ckpt_info_s1 = (epoch, min_val_loss_s1, deepcopy(policy.state_dict()))
+            else:
+                if epoch_val_loss < min_val_loss_s2:
+                    min_val_loss_s2 = epoch_val_loss
+                    best_ckpt_info_s2 = (epoch, min_val_loss_s2, deepcopy(policy.state_dict()))
+
+        print(f'\n Val loss:   {epoch_val_loss:.5f}')
         summary_string = ''
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
 
-        # training
+        # ==========================================
+        # TRAINING
+        # ==========================================
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
-            forward_dict = forward_pass(data, policy)
-            # backward
+            forward_dict = forward_pass(data, policy, train_stage=train_stage)
             loss = forward_dict['loss']
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             train_history.append(detach_dict(forward_dict))
+            
         epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
-        print(f'Train loss: {epoch_train_loss:.5f}')
+        print(f'\n Train loss: {epoch_train_loss:.5f}')
         summary_string = ''
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
 
-        if epoch % 500 == 0:
+        # Save checkpoints periodically
+        if epoch % 400 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(policy.state_dict(), ckpt_path)
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
+    # ==========================================
+    # FINALIZE & SAVE
+    # ==========================================
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
     torch.save(policy.state_dict(), ckpt_path)
 
-    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
-    torch.save(best_state_dict, ckpt_path)
-    print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
+    # Save Best Stage 1
+    if best_ckpt_info_s1 is not None:
+        best_epoch_s1, min_val_loss_s1, best_state_dict_s1 = best_ckpt_info_s1
+        ckpt_path_s1 = os.path.join(ckpt_dir, f'policy_best_stage1_seed_{seed}.ckpt')
+        torch.save(best_state_dict_s1, ckpt_path_s1)
+        print(f'Stage 1 finished: val loss {min_val_loss_s1:.6f} at epoch {best_epoch_s1}')
 
-    # save training curves
-    plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
+    # Save Best Stage 2
+    if best_ckpt_info_s2 is not None:
+        best_epoch_s2, min_val_loss_s2, best_state_dict_s2 = best_ckpt_info_s2
+        ckpt_path_s2 = os.path.join(ckpt_dir, f'policy_best_stage2_seed_{seed}.ckpt')
+        torch.save(best_state_dict_s2, ckpt_path_s2)
+        print(f'Stage 2 finished: val loss {min_val_loss_s2:.6f} at epoch {best_epoch_s2}')
 
-    return best_ckpt_info
+    plot_history(train_history, validation_history, total_epochs, ckpt_dir, seed)
+
+    # Return the final best student model (fallback to stage 1 if stage 2 wasn't run)
+    return best_ckpt_info_s2 if stage_2_epochs > 0 else best_ckpt_info_s1
 
 
 def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
@@ -553,7 +764,11 @@ if __name__ == '__main__':
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
     parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
-    parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
+    
+    # Replaced --num_epochs with two stages:
+    parser.add_argument('--stage_1_epochs', action='store', type=int, help='Epochs to train Teacher', default=4000)
+    parser.add_argument('--stage_2_epochs', action='store', type=int, help='Epochs to train Student via distillation', default=4000)
+    
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
 
     # for ACT
