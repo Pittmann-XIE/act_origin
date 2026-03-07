@@ -33,7 +33,7 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, fusion_type=0):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, fusion_type=0, num_fusion_layers=1):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -77,7 +77,7 @@ class DETRVAE(nn.Module):
         
         self.fusion_type = fusion_type
         if self.fusion_type in [1, 2, 3]:
-            self.fusion_block = FusionBlock(hidden_dim, transformer.nhead, self.fusion_type)
+            self.fusion_block = FusionBlock(hidden_dim, transformer.nhead, self.fusion_type, num_layers=num_fusion_layers)
 
 
     def forward(self, qpos, image, env_state, actions=None, is_pad=None):
@@ -164,22 +164,17 @@ class DETRVAE(nn.Module):
         return a_hat, is_pad_hat, [mu, logvar], attn_weights
 
 
-class FusionBlock(nn.Module):
-    """
-    Fuses two visual feature maps using a full Transformer Decoder-style layer 
-    (Cross-Attention + Add & Norm + Feed-Forward Network + Add & Norm).
-    """
+class FusionLayer(nn.Module):
+    """ A single layer of Cross-Attention + FFN """
     def __init__(self, d_model, nhead, fusion_type, dim_feedforward=2048, dropout=0.1):
         super().__init__()
         self.fusion_type = fusion_type
         
         if fusion_type in [1, 2]:
-            # 1. Cross-Attention part
             self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
             self.norm1 = nn.LayerNorm(d_model)
             self.dropout1 = nn.Dropout(dropout)
             
-            # 2. Feed-Forward Network (FFN) part
             self.linear1 = nn.Linear(d_model, dim_feedforward)
             self.activation = nn.ReLU(inplace=True)
             self.dropout_ffn = nn.Dropout(dropout)
@@ -188,11 +183,10 @@ class FusionBlock(nn.Module):
             self.dropout2 = nn.Dropout(dropout)
             
         elif fusion_type == 3:
-            # --- Stream 1 (cam0 as query) ---
+            # Stream 1
             self.multihead_attn_1 = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
             self.norm1_1 = nn.LayerNorm(d_model)
             self.dropout1_1 = nn.Dropout(dropout)
-            
             self.linear1_1 = nn.Linear(d_model, dim_feedforward)
             self.activation_1 = nn.ReLU(inplace=True)
             self.dropout_ffn_1 = nn.Dropout(dropout)
@@ -200,11 +194,10 @@ class FusionBlock(nn.Module):
             self.norm2_1 = nn.LayerNorm(d_model)
             self.dropout2_1 = nn.Dropout(dropout)
 
-            # --- Stream 2 (cam1 as query) ---
+            # Stream 2
             self.multihead_attn_2 = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
             self.norm1_2 = nn.LayerNorm(d_model)
             self.dropout1_2 = nn.Dropout(dropout)
-            
             self.linear1_2 = nn.Linear(d_model, dim_feedforward)
             self.activation_2 = nn.ReLU(inplace=True)
             self.dropout_ffn_2 = nn.Dropout(dropout)
@@ -215,67 +208,78 @@ class FusionBlock(nn.Module):
     def with_pos_embed(self, tensor, pos):
         return tensor if pos is None else tensor + pos
 
+    def forward(self, f0, f1, p0, p1):
+        if self.fusion_type == 1:
+            q = self.with_pos_embed(f0, p0)
+            k = self.with_pos_embed(f1, p1)
+            attn_out = self.multihead_attn(query=q, key=k, value=f1)[0]
+            out = self.norm1(f0 + self.dropout1(attn_out))
+            ffn_out = self.linear2(self.dropout_ffn(self.activation(self.linear1(out))))
+            out = self.norm2(out + self.dropout2(ffn_out))
+            return out, f1  # f0 is updated, f1 stays the same
+
+        elif self.fusion_type == 2:
+            q = self.with_pos_embed(f1, p1)
+            k = self.with_pos_embed(f0, p0)
+            attn_out = self.multihead_attn(query=q, key=k, value=f0)[0]
+            out = self.norm1(f1 + self.dropout1(attn_out))
+            ffn_out = self.linear2(self.dropout_ffn(self.activation(self.linear1(out))))
+            out = self.norm2(out + self.dropout2(ffn_out))
+            return f0, out  # f1 is updated, f0 stays the same
+
+        elif self.fusion_type == 3:
+            # Stream 1 updates f0 using f1
+            q1 = self.with_pos_embed(f0, p0)
+            k1 = self.with_pos_embed(f1, p1)
+            attn_out_1 = self.multihead_attn_1(query=q1, key=k1, value=f1)[0]
+            out_1 = self.norm1_1(f0 + self.dropout1_1(attn_out_1))
+            ffn_out_1 = self.linear2_1(self.dropout_ffn_1(self.activation_1(self.linear1_1(out_1))))
+            out_1 = self.norm2_1(out_1 + self.dropout2_1(ffn_out_1))
+
+            # Stream 2 updates f1 using f0
+            q2 = self.with_pos_embed(f1, p1)
+            k2 = self.with_pos_embed(f0, p0)
+            attn_out_2 = self.multihead_attn_2(query=q2, key=k2, value=f0)[0]
+            out_2 = self.norm1_2(f1 + self.dropout1_2(attn_out_2))
+            ffn_out_2 = self.linear2_2(self.dropout_ffn_2(self.activation_2(self.linear1_2(out_2))))
+            out_2 = self.norm2_2(out_2 + self.dropout2_2(ffn_out_2))
+
+            return out_1, out_2
+
+
+class FusionBlock(nn.Module):
+    """ Stacks multiple FusionLayers """
+    def __init__(self, d_model, nhead, fusion_type, num_layers=1, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.fusion_type = fusion_type
+        self.num_layers = num_layers
+        # Use ModuleList to stack N identical layers
+        self.layers = nn.ModuleList([
+            FusionLayer(d_model, nhead, fusion_type, dim_feedforward, dropout) 
+            for _ in range(num_layers)
+        ])
+
     def forward(self, feat0, feat1, pos0, pos1):
-        # Flatten from [bs, c, h, w] to [h*w, bs, c] for PyTorch MultiheadAttention
         bs, c, h, w = feat0.shape
         f0 = feat0.flatten(2).permute(2, 0, 1)
         p0 = pos0.flatten(2).permute(2, 0, 1) if pos0 is not None else None
         f1 = feat1.flatten(2).permute(2, 0, 1)
         p1 = pos1.flatten(2).permute(2, 0, 1) if pos1 is not None else None
 
+        # Pass features through all stacked layers iteratively
+        for layer in self.layers:
+            f0, f1 = layer(f0, f1, p0, p1)
+
+        # Reshape back to image format depending on the fusion type
         if self.fusion_type == 1:
-            q = self.with_pos_embed(f0, p0)
-            k = self.with_pos_embed(f1, p1)
-            
-            # Cross-Attention + Add & Norm
-            attn_out = self.multihead_attn(query=q, key=k, value=f1)[0]
-            out = self.norm1(f0 + self.dropout1(attn_out))
-            
-            # FFN + Add & Norm
-            ffn_out = self.linear2(self.dropout_ffn(self.activation(self.linear1(out))))
-            out = self.norm2(out + self.dropout2(ffn_out))
-            
-            out = out.permute(1, 2, 0).view(bs, c, h, w)
+            out = f0.permute(1, 2, 0).view(bs, c, h, w)
             return out, pos0
-
         elif self.fusion_type == 2:
-            q = self.with_pos_embed(f1, p1)
-            k = self.with_pos_embed(f0, p0)
-            
-            # Cross-Attention + Add & Norm
-            attn_out = self.multihead_attn(query=q, key=k, value=f0)[0]
-            out = self.norm1(f1 + self.dropout1(attn_out))
-            
-            # FFN + Add & Norm
-            ffn_out = self.linear2(self.dropout_ffn(self.activation(self.linear1(out))))
-            out = self.norm2(out + self.dropout2(ffn_out))
-            
-            out = out.permute(1, 2, 0).view(bs, c, h, w)
+            out = f1.permute(1, 2, 0).view(bs, c, h, w)
             return out, pos1
-
         elif self.fusion_type == 3:
-            # Stream 1
-            q1 = self.with_pos_embed(f0, p0)
-            k1 = self.with_pos_embed(f1, p1)
-            attn_out_1 = self.multihead_attn_1(query=q1, key=k1, value=f1)[0]
-            out_1 = self.norm1_1(f0 + self.dropout1_1(attn_out_1))
-            
-            ffn_out_1 = self.linear2_1(self.dropout_ffn_1(self.activation_1(self.linear1_1(out_1))))
-            out_1 = self.norm2_1(out_1 + self.dropout2_1(ffn_out_1))
-
-            # Stream 2
-            q2 = self.with_pos_embed(f1, p1)
-            k2 = self.with_pos_embed(f0, p0)
-            attn_out_2 = self.multihead_attn_2(query=q2, key=k2, value=f0)[0]
-            out_2 = self.norm1_2(f1 + self.dropout1_2(attn_out_2))
-            
-            ffn_out_2 = self.linear2_2(self.dropout_ffn_2(self.activation_2(self.linear1_2(out_2))))
-            out_2 = self.norm2_2(out_2 + self.dropout2_2(ffn_out_2))
-
-            out_1 = out_1.permute(1, 2, 0).view(bs, c, h, w)
-            out_2 = out_2.permute(1, 2, 0).view(bs, c, h, w)
-            
-            # Concatenate along width
+            out_1 = f0.permute(1, 2, 0).view(bs, c, h, w)
+            out_2 = f1.permute(1, 2, 0).view(bs, c, h, w)
             out = torch.cat([out_1, out_2], axis=3)
             pos = torch.cat([pos0, pos1], axis=3)
             return out, pos
@@ -383,7 +387,8 @@ def build(args):
         state_dim=state_dim,
         num_queries=args.num_queries,
         camera_names=args.camera_names,
-        fusion_type=getattr(args, 'fusion_type', 0), # <-- ADD THIS LINE
+        fusion_type=getattr(args, 'fusion_type', 0),
+        num_fusion_layers=getattr(args, 'fusion_layers', 1)
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

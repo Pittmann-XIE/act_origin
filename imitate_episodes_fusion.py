@@ -174,7 +174,8 @@ def main(args):
                          'dec_layers': dec_layers,
                          'nheads': nheads,
                          'camera_names': camera_names,
-                         'fusion_type': args['fusion_type']
+                         'fusion_type': args['fusion_type'],
+                         'fusion_layers': args.get('fusion_layers', 1)
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -689,8 +690,9 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
-    parser.add_argument('--fusion_type', action='store', type=int, default=1, 
+    parser.add_argument('--fusion_type', action='store', type=int, default=3, 
                         help='0: concat, 1: cam0->cam1, 2: cam1->cam0, 3: bi-directional')
+    parser.add_argument('--fusion_layers', action='store', type=int, default=3, help='Number of cross-attention fusion layers')
     parser.add_argument('--resume_ckpt_path', action='store', type=str, help='Path to a checkpoint to resume training from', required=False)
     
     main(vars(parser.parse_args()))
