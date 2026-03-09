@@ -58,8 +58,8 @@ class ACTPolicy(nn.Module):
                 
             return loss_dict
         else: 
-            # Inference time (always Stage 0: Student only)
-            a_hat, _, (_, _), attn_weights = self.model(qpos, image_encoder, env_state, train_stage=0)
+            # Inference time (Stage 0 for Student, Stage 1 for Teacher)
+            a_hat, _, (_, _), attn_weights = self.model(qpos, image_encoder, env_state, train_stage=train_stage)
             return a_hat, attn_weights
 
     def configure_optimizers(self):

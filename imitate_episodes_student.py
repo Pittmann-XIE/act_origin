@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["MUJOCO_GL"] = "egl"
 import pickle
 import argparse
 import matplotlib.pyplot as plt
@@ -200,12 +201,18 @@ def main(args):
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
         'real_robot': not is_sim,
-        'resume_ckpt': args.get('resume_ckpt', None) # Provide support for continue training
+        'resume_ckpt': args.get('resume_ckpt', None), # Provide support for continue training
+        'model_to_evaluate': args.get('model_to_evaluate', 'student') # Distinguish teacher/student evaluation
     }
 
     if is_eval:
-        # Load best student checkpoint by default for evaluation
-        ckpt_names =[f'policy_best_stage2_seed_{args["seed"]}.ckpt', f'policy_best.ckpt']
+        eval_model = config['model_to_evaluate']
+        if eval_model == 'teacher':
+            print("Evaluating TEACHER model...")
+            ckpt_names = [f'policy_best_stage1_seed_{args["seed"]}.ckpt', f'policy_best.ckpt']
+        else:
+            print("Evaluating STUDENT model...")
+            ckpt_names = [f'policy_best_stage2_seed_{args["seed"]}.ckpt', f'policy_best.ckpt']
         
         # Determine which checkpoint actually exists
         eval_ckpt = None
@@ -215,11 +222,13 @@ def main(args):
                 break
                 
         if eval_ckpt is None:
-            print("No checkpoints found for evaluation!")
+            print(f"No checkpoints found for evaluation! Looked for: {ckpt_names}")
             exit()
             
-        success_rate, avg_return = eval_bc(config, eval_ckpt, save_episode=True)
-        print(f'{eval_ckpt}: {success_rate=} {avg_return=}\n')
+        success_rates, avg_returns = eval_bc(config, eval_ckpt, save_episode=True)
+        print(f'\n=== Evaluation Complete: {eval_ckpt} ===')
+        print(f'  No Distractor   - Success Rate: {success_rates["clean"]*100:.1f}%, Avg Return: {avg_returns["clean"]:.2f}')
+        print(f'  With Distractor - Success Rate: {success_rates["distractor"]*100:.1f}%, Avg Return: {avg_returns["distractor"]:.2f}\n')
         exit()
 
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
@@ -290,14 +299,24 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+    eval_model = config.get('model_to_evaluate', 'student')
+    print(f'the model to be evaluated is {eval_model}')
+    
+    if eval_model == 'student':
+        # Ensure the student policy only instantiates the first backbone since it only needs one visual input
+        policy_config['camera_names'] = [camera_names[0]]
+    else:
+        # Teacher policy evaluates with all camera backbones
+        policy_config['camera_names'] = camera_names
+        
     policy = make_policy(policy_class, policy_config)
     
     # Checkpoint loading resilient to dict wrappers vs raw state dicts
     checkpoint = torch.load(ckpt_path)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        loading_status = policy.load_state_dict(checkpoint['model_state_dict'])
+        loading_status = policy.load_state_dict(checkpoint['model_state_dict'], strict=False)
     else:
-        loading_status = policy.load_state_dict(checkpoint)
+        loading_status = policy.load_state_dict(checkpoint, strict=False)
         
     print(loading_status)
     policy.cuda()
@@ -315,7 +334,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         sam2_predictor = build_sam2_video_predictor(
             "configs/sam2.1/sam2.1_hiera_s.yaml", # SMALL MODEL
-            "/home/pengtao/ws_ros2humble-main_lab/sam2/checkpoints/sam2.1_hiera_small.pt", 
+            "/home/pengtao/thesis/ws_ros2humble-main_lab/sam2/checkpoints/sam2.1_hiera_small.pt", 
             device=device
         )
     else:
@@ -340,8 +359,12 @@ def eval_bc(config, ckpt_name, save_episode=True):
     max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
 
     num_rollouts = 50
-    episode_returns = []
-    highest_rewards =[]
+    
+    # Dictionaries to store results separately based on condition
+    results = {
+        False: {'returns': [], 'highest_rewards': []},  # Clean (No Distractor)
+        True:  {'returns': [], 'highest_rewards': []}   # With Distractor
+    }
     
     for rollout_id in range(num_rollouts):
         print(f"\n--- Starting Rollout {rollout_id} ---")
@@ -419,7 +442,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
             curr_attn_weights = None
             curr_box_hat = None # Retained for fallback compatability, but won't be filled with YOLO data
 
-            print(f"Running evaluation (Distractor: {has_distractor})...")
+            dist_str = "WITH Distractor" if has_distractor else "NO Distractor"
+            print(f"Running evaluation ({dist_str})...")
+            
             with torch.inference_mode():
                 for t in range(max_timesteps):
                     if onscreen_render:
@@ -465,12 +490,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
                     qpos_history[:, t] = qpos
                     
-                    curr_image = get_image(ts, camera_names)
+                    curr_image = get_image(ts, policy_config['camera_names'])
 
                     # Query policy
                     if config['policy_class'] == "ACT":
                         if t % query_frequency == 0:
-                            all_actions, curr_attn_weights = policy(qpos, curr_image, curr_image) # Inference only sends student features (duplicated here to fulfill argument footprint if not handled in wrapper)
+                            train_stage = 1 if eval_model == 'teacher' else 0
+                            all_actions, curr_attn_weights = policy(qpos, curr_image, curr_image, train_stage=train_stage) # Inference only sends relevant features
                         
                         if temporal_agg:
                             all_time_actions[[t], t:t+num_queries] = all_actions
@@ -492,7 +518,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
                     ### --- RETAINED ATTENTION VISUALIZATION --- ###
                     if save_episode and curr_attn_weights is not None:
-                        vis_img = visualize_attention(curr_image, curr_attn_weights, camera_names)
+                        vis_img = visualize_attention(curr_image, curr_attn_weights, policy_config['camera_names'])
                         attn_vis_list.append(np.uint8(vis_img * 255))
                     ### ---------------------------------------- ###
 
@@ -526,15 +552,15 @@ def eval_bc(config, ckpt_name, save_episode=True):
             episode_return = np.sum(rewards[rewards!=None])
             episode_highest_reward = np.max(rewards)
             
-            if has_distractor:
-                episode_returns.append(episode_return)
-                highest_rewards.append(episode_highest_reward)
+            # Store in respective dictionary
+            results[has_distractor]['returns'].append(episode_return)
+            results[has_distractor]['highest_rewards'].append(episode_highest_reward)
                 
             print(f'Result -> Return: {episode_return}, Highest Reward: {episode_highest_reward}, Success: {episode_highest_reward==env_max_reward}')
 
             # 3. Save the videos immediately after the run completes
             if save_episode:
-                suffix = "with_distractor" if has_distractor else "no_distractor"
+                suffix = f"with_distractor_{eval_model}" if has_distractor else f"no_distractor_{eval_model}"
                 
                 # Save standard top/angle view video
                 save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video_{suffix}_{rollout_id}.mp4'))
@@ -562,25 +588,48 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     del inference_state
                     torch.cuda.empty_cache()
 
-    success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
-    avg_return = np.mean(episode_returns)
-    summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'
+    # Calculate aggregate metrics for Clean
+    success_rate_clean = np.mean(np.array(results[False]['highest_rewards']) == env_max_reward)
+    avg_return_clean = np.mean(results[False]['returns'])
+
+    # Calculate aggregate metrics for Distractor
+    success_rate_dist = np.mean(np.array(results[True]['highest_rewards']) == env_max_reward)
+    avg_return_dist = np.mean(results[True]['returns'])
+
+    summary_str = f'\n=== Evaluation Summary ({eval_model.upper()}) ===\n'
+    summary_str += f'Without Distractor -> Success Rate: {success_rate_clean*100:.1f}%, Avg Return: {avg_return_clean:.2f}\n'
+    summary_str += f'With Distractor    -> Success Rate: {success_rate_dist*100:.1f}%, Avg Return: {avg_return_dist:.2f}\n\n'
+    
+    # Detailed breakdown
     for r in range(env_max_reward+1):
-        more_or_equal_r = (np.array(highest_rewards) >= r).sum()
-        more_or_equal_r_rate = more_or_equal_r / num_rollouts
-        summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n'
+        more_or_equal_r_clean = (np.array(results[False]['highest_rewards']) >= r).sum()
+        more_or_equal_r_dist = (np.array(results[True]['highest_rewards']) >= r).sum()
+        summary_str += f'Reward >= {r}:\n'
+        summary_str += f'  Clean:      {more_or_equal_r_clean}/{num_rollouts} = {more_or_equal_r_clean/num_rollouts*100:.1f}%\n'
+        summary_str += f'  Distractor: {more_or_equal_r_dist}/{num_rollouts} = {more_or_equal_r_dist/num_rollouts*100:.1f}%\n'
 
     print(summary_str)
 
-    # save success rate to txt
-    result_file_name = 'result_' + str(os.getpid()) + '_' + ckpt_name.split('.')[0] + '.txt'
+    # Save detailed stats to txt
+    result_file_name = 'result_' + str(os.getpid()) + '_' + ckpt_name.split('.')[0] + f'_{eval_model}.txt'
     with open(os.path.join(ckpt_dir, result_file_name), 'w') as f:
         f.write(summary_str)
-        f.write(repr(episode_returns))
-        f.write('\n\n')
-        f.write(repr(highest_rewards))
+        f.write('\n\n--- NO DISTRACTOR ---\n')
+        f.write('Returns:\n')
+        f.write(repr(results[False]['returns']))
+        f.write('\nHighest Rewards:\n')
+        f.write(repr(results[False]['highest_rewards']))
+        
+        f.write('\n\n--- WITH DISTRACTOR ---\n')
+        f.write('Returns:\n')
+        f.write(repr(results[True]['returns']))
+        f.write('\nHighest Rewards:\n')
+        f.write(repr(results[True]['highest_rewards']))
 
-    return success_rate, avg_return
+    success_rates = {'clean': success_rate_clean, 'distractor': success_rate_dist}
+    avg_returns = {'clean': avg_return_clean, 'distractor': avg_return_dist}
+    
+    return success_rates, avg_returns
 
 
 def forward_pass(data, policy, train_stage):
@@ -861,5 +910,8 @@ if __name__ == '__main__':
     
     # Continue Training argument
     parser.add_argument('--resume_ckpt', action='store', type=str, help='Path to an exact checkpoint to resume training from', default='/mnt/Ego2Exo/checkpoints/checkpoints_student/policy_epoch_4400_seed_10.ckpt')
+
+    # Toggle between evaluating teacher and student models
+    parser.add_argument('--model_to_evaluate', action='store', type=str, choices=['teacher', 'student'], default='teacher', help='Evaluate teacher or student model')
     
     main(vars(parser.parse_args()))
