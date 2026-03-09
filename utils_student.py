@@ -43,10 +43,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
             def _get_image_data(cam_names):
                 all_cams = []
                 for cam_name in cam_names:
-                    if cam_name == 'top_cropped_1':
-                        img = root[f'/observations/images/{cam_name}'][0]
-                    else:
-                        img = root[f'/observations/images/{cam_name}'][start_ts]
+                    img = root[f'/observations/images/{cam_name}'][start_ts]
                         
                     if img.shape[0] != 480 or img.shape[1] != 640:
                         img = cv2.resize(img, (640, 480), interpolation=cv2.INTER_AREA)
@@ -81,8 +78,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
         
-        # --- MODIFIED: Return image_data twice to satisfy the (image_enc, image_dec, ...) signature
-        return image_data, image_data, qpos_data, action_data, is_pad
+        return image_data, qpos_data, action_data, is_pad
 
 def get_norm_stats(dataset_dir, num_episodes):
     all_qpos_data = []

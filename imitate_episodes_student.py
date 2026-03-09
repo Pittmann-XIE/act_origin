@@ -209,10 +209,10 @@ def main(args):
         eval_model = config['model_to_evaluate']
         if eval_model == 'teacher':
             print("Evaluating TEACHER model...")
-            ckpt_names = [f'policy_best_stage1_seed_{args["seed"]}.ckpt', f'policy_best.ckpt']
+            ckpt_names = [f'policy_best_stage1_seed_{args["seed"]}.ckpt']
         else:
             print("Evaluating STUDENT model...")
-            ckpt_names = [f'policy_best_stage2_seed_{args["seed"]}.ckpt', f'policy_best.ckpt']
+            ckpt_names = [f'policy_best_stage2_seed_{args["seed"]}.ckpt']
         
         # Determine which checkpoint actually exists
         eval_ckpt = None
@@ -334,7 +334,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         sam2_predictor = build_sam2_video_predictor(
             "configs/sam2.1/sam2.1_hiera_s.yaml", # SMALL MODEL
-            "/home/pengtao/thesis/ws_ros2humble-main_lab/sam2/checkpoints/sam2.1_hiera_small.pt", 
+            "/home/pengtao/ws_ros2humble-main_lab/sam2/checkpoints/sam2.1_hiera_small.pt", 
             device=device
         )
     else:
@@ -496,7 +496,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     if config['policy_class'] == "ACT":
                         if t % query_frequency == 0:
                             train_stage = 1 if eval_model == 'teacher' else 0
-                            all_actions, curr_attn_weights = policy(qpos, curr_image, curr_image, train_stage=train_stage) # Inference only sends relevant features
+                            all_actions, curr_attn_weights = policy(qpos, curr_image, train_stage=train_stage) # Inference only sends relevant features
                         
                         if temporal_agg:
                             all_time_actions[[t], t:t+num_queries] = all_actions
@@ -634,9 +634,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 def forward_pass(data, policy, train_stage):
     # Expecting: image_data_enc, image_data_dec, qpos_data, action_data, is_pad
-    image_enc, image_dec, qpos_data, action_data, is_pad = data
-    image_enc, image_dec, qpos_data, action_data, is_pad = image_enc.cuda(), image_dec.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_enc, image_dec, action_data, is_pad, train_stage=train_stage)
+    image_data, qpos_data, action_data, is_pad = data
+    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+    return policy(qpos_data, image_data, action_data, is_pad, train_stage=train_stage)
 
 
 def get_optimizer_stage2(policy, lr, lr_backbone, weight_decay=1e-4):
@@ -748,19 +748,22 @@ def train_bc(train_dataloader, val_dataloader, config):
                     print("Loaded Best Stage 1 Teacher from disk.")
                 else:
                     print("Warning: No Best Stage 1 Teacher found on disk! Using current weights.")
-            
-            # 2. Freeze Teacher's Backbones
-            if hasattr(policy.model, 'backbones') and policy.model.backbones is not None:
-                for param in policy.model.backbones.parameters():
-                    param.requires_grad = False
-                    
-            # 3. Freeze Teacher's Transformer Encoder
-            for param in policy.model.transformer.encoder.parameters():
+            # 2. Freeze ALL parameters in the policy
+            for param in policy.parameters():
                 param.requires_grad = False
+                
+            # 3. Unfreeze Student's Backbone (Camera 0 only)
+            if hasattr(policy.model, 'backbones') and policy.model.backbones is not None:
+                for param in policy.model.backbones[0].parameters():
+                    param.requires_grad = True
+                    
+            # 4. Unfreeze Student's Transformer Encoder
+            for param in policy.model.transformer.student_encoder.parameters():
+                param.requires_grad = True
             
-            print("Teacher parameters frozen.")
+            print("Teacher parameters frozen. Only student encoder and backbones[0] are trainable.")
             
-            # 4. Re-initialize Optimizer for Student parameters only
+            # 5. Re-initialize Optimizer for Student parameters only
             optimizer = get_optimizer_stage2(
                 policy, 
                 lr=policy_config['lr'], 
@@ -898,7 +901,6 @@ if __name__ == '__main__':
     # Replaced --num_epochs with two stages:
     parser.add_argument('--stage_1_epochs', action='store', type=int, help='Epochs to train Teacher', default=4000)
     parser.add_argument('--stage_2_epochs', action='store', type=int, help='Epochs to train Student via distillation', default=4000)
-    
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
 
     # for ACT
@@ -909,7 +911,7 @@ if __name__ == '__main__':
     parser.add_argument('--temporal_agg', action='store_true')
     
     # Continue Training argument
-    parser.add_argument('--resume_ckpt', action='store', type=str, help='Path to an exact checkpoint to resume training from', default='/mnt/Ego2Exo/checkpoints/checkpoints_student/policy_epoch_4400_seed_10.ckpt')
+    parser.add_argument('--resume_ckpt', action='store', type=str, help='Path to an exact checkpoint to resume training from', default=None)
 
     # Toggle between evaluating teacher and student models
     parser.add_argument('--model_to_evaluate', action='store', type=str, choices=['teacher', 'student'], default='teacher', help='Evaluate teacher or student model')

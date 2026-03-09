@@ -75,7 +75,7 @@ To train ACT:
     --ckpt_dir /mnt/Ego2Exo/checkpoints/checkpoints_student\
     --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 16 --dim_feedforward 3200 \
     --lr 2e-5 \
-    --seed 10 > train_student.log &
+    --seed 10 > train_student.log 2>&1 &
 
 
 To evaluate the policy, run the same command but add ``--eval``. This loads the best validation checkpoint.

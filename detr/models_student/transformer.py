@@ -26,7 +26,6 @@ class Transformer(nn.Module):
                  return_intermediate_dec=False):
         super().__init__()
 
-        # --- MODIFICATION START: Add Student Encoder ---
         encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
@@ -35,8 +34,11 @@ class Transformer(nn.Module):
         # Student encoder structurally identical to the teacher
         student_encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                         dropout, activation, normalize_before)
-        self.student_encoder = TransformerEncoder(student_encoder_layer, num_encoder_layers, encoder_norm)
-        # --- MODIFICATION END ---
+        
+        # FIX: Create a separate LayerNorm for the student so they do not share weights
+        student_encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
+        
+        self.student_encoder = TransformerEncoder(student_encoder_layer, num_encoder_layers, student_encoder_norm)
 
         decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
