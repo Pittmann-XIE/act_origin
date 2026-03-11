@@ -5,6 +5,7 @@ import torchvision.transforms as transforms
 from detr.main import build_ACT_model_and_optimizer, build_CNNMLP_model_and_optimizer
 import IPython
 e = IPython.embed
+import torch
 
 
 class ACTPolicy(nn.Module):
@@ -14,7 +15,7 @@ class ACTPolicy(nn.Module):
         self.model = model 
         self.optimizer = optimizer
         self.kl_weight = args_override['kl_weight']
-        # Removed box_weight
+        self.kd_weight = args_override['kd_weight']
 
     def __call__(self, qpos, images, actions=None, is_pad=None, train_stage=1):
         env_state = None
@@ -36,6 +37,9 @@ class ACTPolicy(nn.Module):
                 l1 = (F.l1_loss(actions, a_hat, reduction='none') * ~is_pad.unsqueeze(-1)).mean()
                 loss_dict['l1'] = l1
                 loss_dict['kl'] = total_kld[0]
+                
+                loss_dict['distill_loss'] = torch.tensor(0.0, device=l1.device) 
+                
                 loss_dict['loss'] = l1 + total_kld[0] * self.kl_weight
                 
             elif train_stage == 2:
@@ -53,7 +57,7 @@ class ACTPolicy(nn.Module):
                 loss_dict['distill_loss'] = distill_loss
                 
                 # Combine standard behavioral cloning loss with distillation loss
-                loss_dict['loss'] = l1 + (total_kld[0] * self.kl_weight) + distill_loss
+                loss_dict['loss'] = l1 + distill_loss*self.kd_weight
                 
             return loss_dict
         else: 

@@ -50,6 +50,8 @@ class Transformer(nn.Module):
 
         self.d_model = d_model
         self.nhead = nhead
+        
+        self.cam2_mask_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
     def _reset_parameters(self):
         for p in self.parameters():
@@ -87,28 +89,40 @@ class Transformer(nn.Module):
             
         elif train_stage == 2:
             # Stage 2: Distillation
-            with torch.no_grad(): # Freeze teacher execution
+            with torch.no_grad(): 
                 memory_teacher = self.encoder(src_t, src_key_padding_mask=mask, pos=pos_t)
             
-            memory_student = self.student_encoder(src_s, src_key_padding_mask=mask, pos=pos_s)
+            seq_s, bs_s, _ = src_s.shape
+            missing_len = pos_t.shape[0] - seq_s
             
-            # Map student indices to teacher map
-            cam1_indices = []
-            for y in range(h_s):
-                for x in range(w_s):
-                    cam1_indices.append(y * w_total + x)
+            mask_tokens = self.cam2_mask_token.repeat(missing_len, bs_s, 1)
+            src_s_padded = torch.cat([src_s, mask_tokens], dim=0)
             
-            distill_indices = torch.tensor([0, 1] + [i + 2 for i in cam1_indices], device=src_s.device)
-            memory_teacher_cam1 = memory_teacher[distill_indices]
+            memory_student = self.student_encoder(src_s_padded, src_key_padding_mask=mask, pos=pos_t)
             
-            # Decode using student memory to ensure end-to-end viability
+            memory_teacher_cam1 = memory_teacher 
             memory_to_decode = memory_student
-            pos_to_decode = pos_s
+            pos_to_decode = pos_t
             
         else:
             # Stage 0: Inference (Student Only)
-            memory_to_decode = self.student_encoder(src_s, src_key_padding_mask=mask, pos=pos_s)
-            pos_to_decode = pos_s
+            seq_s, bs_s, _ = src_s.shape
+            
+            # --- THE FIX: Reconstruct pos_t exactly as the teacher saw it ---
+            # pos_student is shape (B, C, H, W). The teacher concatenated two of these along width.
+            pos_teacher_recon = torch.cat([pos_student, pos_student], dim=3)
+            
+            # Now flatten and prepend the latent/proprio embeddings just like Stage 1
+            pos_t = pos_teacher_recon.flatten(2).permute(2, 0, 1).repeat(1, bs_s, 1)
+            pos_t = torch.cat([additional_pos_embed.unsqueeze(1).repeat(1, bs_s, 1), pos_t], axis=0)
+            # ----------------------------------------------------------------
+            
+            missing_len = pos_t.shape[0] - seq_s
+            mask_tokens = self.cam2_mask_token.repeat(missing_len, bs_s, 1)
+            src_s_padded = torch.cat([src_s, mask_tokens], dim=0)
+            
+            memory_to_decode = self.student_encoder(src_s_padded, src_key_padding_mask=mask, pos=pos_t)
+            pos_to_decode = pos_t
 
         tgt = torch.zeros_like(query_embed)
         hs, attn_weights = self.decoder(tgt, memory_to_decode, memory_key_padding_mask=mask,

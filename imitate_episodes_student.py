@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 os.environ["MUJOCO_GL"] = "egl"
 import pickle
 import argparse
@@ -171,6 +171,7 @@ def main(args):
         policy_config = {'lr': args['lr'],
                          'num_queries': args['chunk_size'],
                          'kl_weight': args['kl_weight'],
+                         'kd_weight': args['kd_weight'],
                          'hidden_dim': args['hidden_dim'],
                          'dim_feedforward': args['dim_feedforward'],
                          'lr_backbone': lr_backbone,
@@ -700,21 +701,34 @@ def train_bc(train_dataloader, val_dataloader, config):
         # If resuming DIRECTLY into Stage 2, setup the frozen flags & specific optimizer first
         if start_epoch > stage_1_epochs:
             print("Resuming directly into Stage 2. Freezing Teacher parameters...")
-            if hasattr(policy.model, 'backbones') and policy.model.backbones is not None:
-                for param in policy.model.backbones.parameters():
-                    param.requires_grad = False
-            for param in policy.model.transformer.encoder.parameters():
+            
+            # 1. Freeze ALL parameters in the policy
+            for param in policy.parameters():
                 param.requires_grad = False
+                
+            # # 2. Unfreeze Student's Backbone (Camera 0 only)
+            # if hasattr(policy.model, 'backbones') and policy.model.backbones is not None:
+            #     for param in policy.model.backbones[0].parameters():
+            #         param.requires_grad = True
+                    
+            # 3. Unfreeze Student's Transformer Encoder
+            if hasattr(policy.model.transformer, 'student_encoder'):
+                for param in policy.model.transformer.student_encoder.parameters():
+                    param.requires_grad = True
                 
             optimizer = get_optimizer_stage2(
                 policy, 
                 lr=policy_config['lr'], 
                 lr_backbone=policy_config['lr_backbone']
             )
-            
         # Load the optimizer state AFTER potentially re-initializing it for Stage 2
         if isinstance(checkpoint, dict) and 'optimizer_state_dict' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print("Loaded optimizer state successfully.")
+            except ValueError as e:
+                print(f"\nWarning: Could not load optimizer state dict: {e}")
+                print("This is expected if trainable parameters (e.g., frozen layers) changed since the checkpoint was saved. Starting with a fresh optimizer.")
             
         print(f"Successfully resumed. Starting at Epoch {start_epoch}.\n")
 
@@ -752,10 +766,10 @@ def train_bc(train_dataloader, val_dataloader, config):
             for param in policy.parameters():
                 param.requires_grad = False
                 
-            # 3. Unfreeze Student's Backbone (Camera 0 only)
-            if hasattr(policy.model, 'backbones') and policy.model.backbones is not None:
-                for param in policy.model.backbones[0].parameters():
-                    param.requires_grad = True
+            # # 3. Unfreeze Student's Backbone (Camera 0 only)
+            # if hasattr(policy.model, 'backbones') and policy.model.backbones is not None:
+            #     for param in policy.model.backbones[0].parameters():
+            #         param.requires_grad = True
                     
             # 4. Unfreeze Student's Transformer Encoder
             for param in policy.model.transformer.student_encoder.parameters():
@@ -780,8 +794,9 @@ def train_bc(train_dataloader, val_dataloader, config):
             for batch_idx, data in enumerate(val_dataloader):
                 forward_dict = forward_pass(data, policy, train_stage=train_stage)
                 epoch_dicts.append(forward_dict)
-            
+                
             epoch_summary = compute_dict_mean(epoch_dicts)
+            epoch_summary = {k: v.item() if hasattr(v, 'item') else v for k, v in epoch_summary.items()}
             validation_history.append(epoch_summary)
             epoch_val_loss = epoch_summary['loss']
             
@@ -871,13 +886,25 @@ def train_bc(train_dataloader, val_dataloader, config):
     return best_ckpt_info_s2 if stage_2_epochs > 0 else best_ckpt_info_s1
 
 def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
+    # Find all unique keys across the entire training history
+    all_keys = set()
+    for summary in train_history:
+        all_keys.update(summary.keys())
+        
     # save training curves
-    for key in train_history[0]:
+    for key in all_keys:
         plot_path = os.path.join(ckpt_dir, f'train_val_{key}_seed_{seed}.png')
         plt.figure()
-        # FIX: Check for .item() in list comprehensions
-        train_values = [summary[key].item() if hasattr(summary[key], 'item') else summary[key] for summary in train_history]
-        val_values = [summary[key].item() if hasattr(summary[key], 'item') else summary[key] for summary in validation_history]
+        
+        # Use .get(key, 0.0) to default to 0.0 if the metric isn't in that specific epoch
+        # Safely extract scalar if the value is a tensor (handles older checkpoints as well)
+        def get_scalar(summary, k):
+            v = summary.get(k, 0.0)
+            return v.item() if hasattr(v, 'item') else v
+
+        train_values = [get_scalar(summary, key) for summary in train_history]
+        val_values = [get_scalar(summary, key) for summary in validation_history]
+        
         plt.plot(np.linspace(0, num_epochs-1, len(train_history)), train_values, label='train')
         plt.plot(np.linspace(0, num_epochs-1, len(validation_history)), val_values, label='validation')
         # plt.ylim([-0.1, 1])
@@ -885,6 +912,7 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
         plt.legend()
         plt.title(key)
         plt.savefig(plot_path)
+        plt.close() # Added to prevent memory leaks from unclosed figures
     print(f'Saved plots to {ckpt_dir}')
 
 
@@ -900,11 +928,11 @@ if __name__ == '__main__':
     
     # Replaced --num_epochs with two stages:
     parser.add_argument('--stage_1_epochs', action='store', type=int, help='Epochs to train Teacher', default=4000)
-    parser.add_argument('--stage_2_epochs', action='store', type=int, help='Epochs to train Student via distillation', default=4000)
+    parser.add_argument('--stage_2_epochs', action='store', type=int, help='Epochs to train Student via distillation', default=8000)
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
 
     # for ACT
-    parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
+    parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)    
     parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
@@ -915,5 +943,8 @@ if __name__ == '__main__':
 
     # Toggle between evaluating teacher and student models
     parser.add_argument('--model_to_evaluate', action='store', type=str, choices=['teacher', 'student'], default='teacher', help='Evaluate teacher or student model')
+    
+    parser.add_argument('--kd_weight', action='store', type=int, help='KD Weight', default=1)
+    
     
     main(vars(parser.parse_args()))
