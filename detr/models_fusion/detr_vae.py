@@ -7,7 +7,7 @@ from torch import nn
 from torch.autograd import Variable
 from .backbone import build_backbone
 from .transformer import build_transformer, TransformerEncoder, TransformerEncoderLayer
-
+from torch.nn import functional as F
 import numpy as np
 
 import IPython
@@ -33,7 +33,7 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, fusion_type=0, num_fusion_layers=1):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, fusion_type=0, num_fusion_layers=1, use_qformer=False):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -78,7 +78,12 @@ class DETRVAE(nn.Module):
         self.fusion_type = fusion_type
         if self.fusion_type in [1, 2, 3]:
             self.fusion_block = FusionBlock(hidden_dim, transformer.nhead, self.fusion_type, num_layers=num_fusion_layers)
-
+        # Add the use_qformer flag
+        self.use_qformer = use_qformer
+        if self.use_qformer:
+            # Hardcoded for ResNet18 output on a 480x640 image (H/32=15, W/32=20). 
+            self.learned_feat1 = nn.Parameter(torch.randn(1, hidden_dim, 15, 20))
+            self.learned_pos1 = nn.Parameter(torch.randn(1, hidden_dim, 15, 20))
 
     def forward(self, qpos, image, env_state, actions=None, is_pad=None):
         """
@@ -123,7 +128,7 @@ class DETRVAE(nn.Module):
             all_cam_features = []
             all_cam_pos = []
             for cam_id, cam_name in enumerate(self.camera_names):
-                features, pos = self.backbones[cam_id](image[:, cam_id]) # HARDCODED
+                features, pos = self.backbones[cam_id](image[:, cam_id])
                 features = features[0] # take the last layer feature
                 pos = pos[0]
                 all_cam_features.append(self.input_proj(features))
@@ -132,22 +137,51 @@ class DETRVAE(nn.Module):
             # proprioception features
             proprio_input = self.input_proj_robot_state(qpos)
             
-            # --- MODIFIED FUSION LOGIC START ---
+            # --- MODIFIED FUSION LOGIC WITH DISTILLATION START ---
+            feature_distill_loss = torch.tensor(0.0).to(qpos.device)
+            
             if self.fusion_type == 0:
-                # fold camera dimension into width dimension (default behavior)
                 src = torch.cat(all_cam_features, axis=3)
                 pos = torch.cat(all_cam_pos, axis=3)
+                
             elif self.fusion_type in [1, 2, 3]:
-                # Apply the cross-attention fusion block for exactly 2 cameras
-                assert len(all_cam_features) == 2, "Fusion block requires exactly 2 camera streams."
-                src, pos = self.fusion_block(
-                    all_cam_features[0], all_cam_features[1], 
-                    all_cam_pos[0], all_cam_pos[1]
-                )
-            else:
-                raise ValueError(f"Invalid fusion_type: {self.fusion_type}")
-            # --- MODIFIED FUSION LOGIC END ---
+                
+                # 1. Compute Teacher features ONLY IF the second camera (crop) is provided
+                if len(all_cam_features) >= 2:
+                    # FIX 1: Removed `with torch.no_grad():` so the Teacher model can actually train!
+                    # (When training the Student Q-Former, the base policy freezes the weights anyway, 
+                    # and the distillation loss uses .detach(), so it's safe to remove this).
+                    teacher_src, teacher_pos = self.fusion_block(
+                        all_cam_features[0], all_cam_features[1], 
+                        all_cam_pos[0], all_cam_pos[1]
+                    )
+                
+                # 2. If Q-former is active, proxy feat1 and compute Student's fused features
+                if getattr(self, 'use_qformer', False):
+                    bs = image.shape[0]
+                    q_feat1 = self.learned_feat1.expand(bs, -1, -1, -1)
+                    q_pos1 = self.learned_pos1.expand(bs, -1, -1, -1)
+                    
+                    student_src, student_pos = self.fusion_block(
+                        all_cam_features[0], q_feat1, 
+                        all_cam_pos[0], q_pos1
+                    )
+                    
+                    # 3. Calculate the Distillation Loss ONLY IF Teacher features were computed
+                    if len(all_cam_features) >= 2:
+                        # We detach the teacher so gradients only flow into the Q-former
+                        feature_distill_loss = F.mse_loss(student_src, teacher_src.detach())
+                    
+                    # The rest of the network uses the Student's features
+                    src = student_src
+                    pos = student_pos
 
+                else: # FIX 2: Corrected indentation to align with `if getattr(self, 'use_qformer', False):`
+                    # Standard inference/training without Q-former (Requires 2 cameras)
+                    assert len(all_cam_features) >= 2, "Need at least 2 cameras for standard fusion without Q-former."
+                    src = teacher_src
+                    pos = teacher_pos
+                    
             hs, attn_weights, = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)
         else:
             qpos = self.input_proj_robot_state(qpos)
@@ -161,7 +195,7 @@ class DETRVAE(nn.Module):
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
         
-        return a_hat, is_pad_hat, [mu, logvar], attn_weights
+        return a_hat, is_pad_hat, [mu, logvar], attn_weights, feature_distill_loss
 
 
 class FusionLayer(nn.Module):
@@ -388,7 +422,8 @@ def build(args):
         num_queries=args.num_queries,
         camera_names=args.camera_names,
         fusion_type=getattr(args, 'fusion_type', 0),
-        num_fusion_layers=getattr(args, 'fusion_layers', 1)
+        num_fusion_layers=getattr(args, 'fusion_layers', 1),
+        use_qformer=getattr(args, 'use_qformer', False)
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

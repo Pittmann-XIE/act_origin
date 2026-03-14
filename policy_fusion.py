@@ -1,6 +1,7 @@
 import torch.nn as nn
 from torch.nn import functional as F
 import torchvision.transforms as transforms
+import torch
 
 from detr.main import build_ACT_model_and_optimizer, build_CNNMLP_model_and_optimizer
 import IPython
@@ -24,23 +25,61 @@ class ACTPolicy(nn.Module):
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]
 
-            a_hat, is_pad_hat, (mu, logvar), _ = self.model(qpos, image, env_state, actions, is_pad)
+            # Catch the 5th return value
+            a_hat, is_pad_hat, (mu, logvar), _, distill_loss = self.model(qpos, image, env_state, actions, is_pad)
+            
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
             all_l1 = F.l1_loss(actions, a_hat, reduction='none')
             l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
+            
             loss_dict['l1'] = l1
             loss_dict['kl'] = total_kld[0]
-            loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
+            loss_dict['distill'] = distill_loss # Record the distillation loss
+            
+            # Add distillation loss to the total loss
+            # You can add a weight multiplier here (e.g., 10.0 * distill_loss) if you want to force it harder
+            loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight + loss_dict['distill']
                 
             return loss_dict
         else: # inference time
-            a_hat, _, (_, _), attn_weights = self.model(qpos, image, env_state) # no action, sample from prior
+            # Catch the 5th return value
+            a_hat, _, (_, _), attn_weights, _ = self.model(qpos, image, env_state) 
             return a_hat, attn_weights
 
     def configure_optimizers(self):
         return self.optimizer
 
+class ACTPolicyQFormer(ACTPolicy):
+    def __init__(self, args_override):
+        # Force the DETRVAE model to use the Q-former logic
+        args_override['use_qformer'] = True
+        
+        # Initialize the base ACTPolicy
+        super().__init__(args_override)
+        
+        # FIX: detr.main.build_ACT_model_and_optimizer often drops unrecognized arguments.
+        # If use_qformer was dropped during build, we manually inject the parameters here.
+        if not hasattr(self.model, 'learned_feat1'):
+            self.model.use_qformer = True
+            hidden_dim = self.model.transformer.d_model
+            # Dimensions: (1, hidden_dim, H/32, W/32) -> (1, hidden_dim, 15, 20) for 480x640 images
+            self.model.register_parameter('learned_feat1', nn.Parameter(torch.randn(1, hidden_dim, 15, 20)))
+            self.model.register_parameter('learned_pos1', nn.Parameter(torch.randn(1, hidden_dim, 15, 20)))
+        
+        # 1. Freeze all parameters in the network
+        for param in self.model.parameters():
+            param.requires_grad = False
+            
+        # 2. Unfreeze ONLY the newly added learnable queries
+        self.model.learned_feat1.requires_grad = True
+        self.model.learned_pos1.requires_grad = True
+        
+        # 3. Override the optimizer to only train these two parameters
+        self.optimizer = torch.optim.AdamW([
+            self.model.learned_feat1,
+            self.model.learned_pos1
+        ], lr=args_override['lr'], weight_decay=1e-4)
 
 class CNNMLPPolicy(nn.Module):
     def __init__(self, args_override):

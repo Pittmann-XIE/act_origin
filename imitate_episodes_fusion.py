@@ -14,7 +14,7 @@ from constants import PUPPET_GRIPPER_JOINT_OPEN
 from utils_fusion import load_data # data functions
 from utils_fusion import sample_box_pose, sample_insertion_pose # robot functions
 from utils_fusion import compute_dict_mean, set_seed, detach_dict # helper functions
-from policy_fusion import ACTPolicy, CNNMLPPolicy
+from policy_fusion import ACTPolicy, ACTPolicyQFormer, CNNMLPPolicy
 from visualize_episodes import save_videos
 
 # Import the new ENABLE_DISTRACTOR flag
@@ -209,7 +209,8 @@ def main(args):
                          'nheads': nheads,
                          'camera_names': camera_names,
                          'fusion_type': args['fusion_type'],
-                         'fusion_layers': args.get('fusion_layers', 1)
+                         'fusion_layers': args.get('fusion_layers', 1),
+                         'use_qformer': args.get('use_qformer', False)
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -266,7 +267,10 @@ def main(args):
 
 def make_policy(policy_class, policy_config):
     if policy_class == 'ACT':
-        policy = ACTPolicy(policy_config)
+        if policy_config.get('use_qformer', False):
+            policy = ACTPolicyQFormer(policy_config)
+        else:
+            policy = ACTPolicy(policy_config)
     elif policy_class == 'CNNMLP':
         policy = CNNMLPPolicy(policy_config)
     else:
@@ -313,7 +317,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
-    loading_status = policy.load_state_dict(torch.load(ckpt_path))
+    loading_status = policy.load_state_dict(torch.load(ckpt_path), strict=False)
     print(loading_status)
     policy.cuda()
     policy.eval()
@@ -326,6 +330,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
     post_process = lambda a: a * stats['action_std'] + stats['action_mean']
     
     # 1. Initialize SAM 2 Small conditionally
+    # Check if SAM 2 is needed
+    use_qformer = config['policy_config'].get('use_qformer', False)
+    use_sam2 = any('cropped' in cam for cam in camera_names) and not use_qformer
     if use_sam2:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         sam2_predictor = build_sam2_video_predictor(
@@ -618,7 +625,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     if resume_ckpt_path is not None:
         if os.path.exists(resume_ckpt_path):
             print(f"\n=> Resuming training from checkpoint: {resume_ckpt_path}")
-            loading_status = policy.load_state_dict(torch.load(resume_ckpt_path))
+            loading_status = policy.load_state_dict(torch.load(resume_ckpt_path), strict=False)
             print(loading_status)
         else:
             print(f"\n[!] Warning: Resume checkpoint not found at {resume_ckpt_path}. Starting from scratch.")
@@ -728,6 +735,7 @@ if __name__ == '__main__':
     parser.add_argument('--fusion_type', action='store', type=int, default=1, 
                         help='0: concat, 1: cam0->cam1, 2: cam1->cam0, 3: bi-directional')
     parser.add_argument('--fusion_layers', action='store', type=int, default=3, help='Number of cross-attention fusion layers')
-    parser.add_argument('--resume_ckpt_path', action='store', type=str, help='Path to a checkpoint to resume training from', required=False)
+    parser.add_argument('--resume_ckpt_path', action='store', type=str, help='Path to a checkpoint to resume training from', default='/mnt/Ego2Exo/checkpoints/checkpoints_fusion_2/policy_best.ckpt')
+    parser.add_argument('--use_qformer', action='store_true', help='Use learned queries instead of cropped image', default=True)
     
     main(vars(parser.parse_args()))
