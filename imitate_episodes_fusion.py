@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import pickle
 import argparse
 import matplotlib.pyplot as plt
@@ -14,7 +14,7 @@ from constants import PUPPET_GRIPPER_JOINT_OPEN
 from utils_fusion import load_data # data functions
 from utils_fusion import sample_box_pose, sample_insertion_pose # robot functions
 from utils_fusion import compute_dict_mean, set_seed, detach_dict # helper functions
-from policy_fusion import ACTPolicy, ACTPolicyQFormer, CNNMLPPolicy
+from policy_fusion import ACTPolicy, ACTPolicyQFormer, CNNMLPPolicy, ACTPolicyImplicitDistill
 from visualize_episodes import save_videos
 
 # Import the new ENABLE_DISTRACTOR flag
@@ -210,7 +210,8 @@ def main(args):
                          'camera_names': camera_names,
                          'fusion_type': args['fusion_type'],
                          'fusion_layers': args.get('fusion_layers', 1),
-                         'use_qformer': args.get('use_qformer', False)
+                         'use_qformer': args.get('use_qformer', False),
+                         'use_implicit_distill': args.get('use_implicit_distill', False)
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -267,7 +268,9 @@ def main(args):
 
 def make_policy(policy_class, policy_config):
     if policy_class == 'ACT':
-        if policy_config.get('use_qformer', False):
+        if policy_config.get('use_implicit_distill', False):
+            policy = ACTPolicyImplicitDistill(policy_config)
+        elif policy_config.get('use_qformer', False):
             policy = ACTPolicyQFormer(policy_config)
         else:
             policy = ACTPolicy(policy_config)
@@ -276,7 +279,6 @@ def make_policy(policy_class, policy_config):
     else:
         raise NotImplementedError
     return policy
-
 
 def make_optimizer(policy_class, policy):
     if policy_class == 'ACT':
@@ -609,7 +611,6 @@ def forward_pass(data, policy):
     image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
     return policy(qpos_data, image_data, action_data, is_pad)
 
-
 def train_bc(train_dataloader, val_dataloader, config):
     num_epochs = config['num_epochs']
     ckpt_dir = config['ckpt_dir']
@@ -619,16 +620,12 @@ def train_bc(train_dataloader, val_dataloader, config):
     resume_ckpt_path = config.get('resume_ckpt_path', None)
 
     set_seed(seed)
-
     policy = make_policy(policy_class, policy_config)
 
-    if resume_ckpt_path is not None:
-        if os.path.exists(resume_ckpt_path):
-            print(f"\n=> Resuming training from checkpoint: {resume_ckpt_path}")
-            loading_status = policy.load_state_dict(torch.load(resume_ckpt_path), strict=False)
-            print(loading_status)
-        else:
-            print(f"\n[!] Warning: Resume checkpoint not found at {resume_ckpt_path}. Starting from scratch.")
+    if resume_ckpt_path is not None and os.path.exists(resume_ckpt_path):
+        print(f"\n=> Resuming training from checkpoint: {resume_ckpt_path}")
+        loading_status = policy.load_state_dict(torch.load(resume_ckpt_path), strict=False)
+        print(loading_status)
 
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
@@ -637,80 +634,88 @@ def train_bc(train_dataloader, val_dataloader, config):
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
+
     for epoch in tqdm(range(num_epochs)):
-        print(f'\nEpoch {epoch}')
-        # validation
+        # --- Validation Pass ---
         with torch.inference_mode():
             policy.eval()
             epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
                 forward_dict = forward_pass(data, policy)
-                epoch_dicts.append(forward_dict)
-            epoch_summary = compute_dict_mean(epoch_dicts)
-            validation_history.append(epoch_summary)
+                clean_dict = {k: v.item() if torch.is_tensor(v) else v for k, v in forward_dict.items()}
+                epoch_dicts.append(clean_dict)
+            
+            val_epoch_summary = compute_dict_mean(epoch_dicts)
+            validation_history.append(val_epoch_summary)
 
-            epoch_val_loss = epoch_summary['loss']
-            if epoch_val_loss < min_val_loss:
-                min_val_loss = epoch_val_loss
+            if val_epoch_summary['loss'] < min_val_loss:
+                min_val_loss = val_epoch_summary['loss']
                 best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
-        print(f'Val loss:   {epoch_val_loss:.5f}')
-        summary_string = ''
-        for k, v in epoch_summary.items():
-            summary_string += f'{k}: {v.item():.3f} '
-        print(summary_string)
 
-        # training
+        # --- Training Pass ---
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
             forward_dict = forward_pass(data, policy)
-            # backward
             loss = forward_dict['loss']
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            train_history.append(detach_dict(forward_dict))
-        epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
-        epoch_train_loss = epoch_summary['loss']
-        print(f'Train loss: {epoch_train_loss:.5f}')
-        summary_string = ''
-        for k, v in epoch_summary.items():
-            summary_string += f'{k}: {v.item():.3f} '
-        print(summary_string)
+            
+            clean_train_dict = {k: v.item() if torch.is_tensor(v) else v for k, v in forward_dict.items()}
+            train_history.append(clean_train_dict)
+
+        # --- Logging ---
+        train_epoch_summary = compute_dict_mean(train_history[-len(train_dataloader):])
+        
+        # Re-added the summary string generation (without .item()!)
+        train_summary_string = ''
+        for k, v in train_epoch_summary.items():
+            train_summary_string += f'{k}: {v:.3f} '
+            
+        val_summary_string = ''
+        for k, v in val_epoch_summary.items():
+            val_summary_string += f'{k}: {v:.3f} '
+        
+        print(f'\nEpoch {epoch}')
+        print(f'Train loss: {train_epoch_summary["loss"]:.5f}')
+        print(f'Train summary: {train_summary_string}')
+        print(f'Val loss:   {val_epoch_summary["loss"]:.5f}') 
+        print(f'Val summary:   {val_summary_string}')
 
         if epoch % 100 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(policy.state_dict(), ckpt_path)
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
-    ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
-    torch.save(policy.state_dict(), ckpt_path)
+    # --- Save Final and Best Checkpoints ---
+    torch.save(policy.state_dict(), os.path.join(ckpt_dir, f'policy_last.ckpt'))
 
-    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
-    torch.save(best_state_dict, ckpt_path)
-    print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
+    if best_ckpt_info:
+        best_epoch, best_val_loss, best_state_dict = best_ckpt_info
+        torch.save(best_state_dict, os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt'))
+        print(f'Training finished: Val loss {best_val_loss:.6f} at epoch {best_epoch}')
 
-    # save training curves
     plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
-
     return best_ckpt_info
-
 
 def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
     # save training curves
     for key in train_history[0]:
         plot_path = os.path.join(ckpt_dir, f'train_val_{key}_seed_{seed}.png')
         plt.figure()
-        train_values = [summary[key].item() for summary in train_history]
-        val_values = [summary[key].item() for summary in validation_history]
+        # REMOVED .item() because they are already floats
+        train_values = [summary[key] for summary in train_history]
+        val_values = [summary[key] for summary in validation_history]
+        
         plt.plot(np.linspace(0, num_epochs-1, len(train_history)), train_values, label='train')
         plt.plot(np.linspace(0, num_epochs-1, len(validation_history)), val_values, label='validation')
-        # plt.ylim([-0.1, 1])
+        
         plt.tight_layout()
         plt.legend()
         plt.title(key)
         plt.savefig(plot_path)
+        plt.close() # CRITICAL: Free system RAM
     print(f'Saved plots to {ckpt_dir}')
 
 
@@ -736,6 +741,7 @@ if __name__ == '__main__':
                         help='0: concat, 1: cam0->cam1, 2: cam1->cam0, 3: bi-directional')
     parser.add_argument('--fusion_layers', action='store', type=int, default=3, help='Number of cross-attention fusion layers')
     parser.add_argument('--resume_ckpt_path', action='store', type=str, help='Path to a checkpoint to resume training from', default='/mnt/Ego2Exo/checkpoints/checkpoints_fusion_2/policy_best.ckpt')
-    parser.add_argument('--use_qformer', action='store_true', help='Use learned queries instead of cropped image', default=True)
+    parser.add_argument('--use_qformer', action='store_true', help='Use learned queries instead of cropped image', default=False)
+    parser.add_argument('--use_implicit_distill', action='store_true', help='Use implicit attention distillation on cam0', default=True)
     
     main(vars(parser.parse_args()))

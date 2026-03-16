@@ -33,7 +33,7 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, fusion_type=0, num_fusion_layers=1, use_qformer=False):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, fusion_type=0, num_fusion_layers=1, use_qformer=False, use_implicit_distill=False):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -85,6 +85,12 @@ class DETRVAE(nn.Module):
             self.learned_feat1 = nn.Parameter(torch.randn(1, hidden_dim, 15, 20))
             self.learned_pos1 = nn.Parameter(torch.randn(1, hidden_dim, 15, 20))
 
+        # --- NEW: Implicit Attention Distillation Flag and Block ---
+        self.use_implicit_distill = use_implicit_distill
+        if self.use_implicit_distill:
+            self.implicit_attention_block = FusionBlock(hidden_dim, transformer.nhead, fusion_type=1, num_layers=num_fusion_layers+1)
+        print(f'DETRVAE: q-former: {self.use_qformer}, implicit: {self.use_implicit_distill}')
+            
     def forward(self, qpos, image, env_state, actions=None, is_pad=None):
         """
         qpos: batch, qpos_dim
@@ -94,7 +100,8 @@ class DETRVAE(nn.Module):
         """
         is_training = actions is not None # train or val
         bs, _ = qpos.shape
-        ### Obtain latent z from action sequence
+        
+        ### Obtain latent z from action sequence (VAE encoding)
         if is_training:
             # project action sequence to embedding dim, and concat with a CLS token
             action_embed = self.encoder_action_proj(actions) # (bs, seq, hidden_dim)
@@ -104,12 +111,15 @@ class DETRVAE(nn.Module):
             cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1) # (bs, 1, hidden_dim)
             encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], axis=1) # (bs, seq+1, hidden_dim)
             encoder_input = encoder_input.permute(1, 0, 2) # (seq+1, bs, hidden_dim)
+            
             # do not mask cls token
             cls_joint_is_pad = torch.full((bs, 2), False).to(qpos.device) # False: not a padding
             is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)  # (bs, seq+1)
+            
             # obtain position embedding
             pos_embed = self.pos_table.clone().detach()
             pos_embed = pos_embed.permute(1, 0, 2)  # (seq+1, 1, hidden_dim)
+            
             # query model
             encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
             encoder_output = encoder_output[0] # take cls output only
@@ -137,7 +147,7 @@ class DETRVAE(nn.Module):
             # proprioception features
             proprio_input = self.input_proj_robot_state(qpos)
             
-            # --- MODIFIED FUSION LOGIC WITH DISTILLATION START ---
+            # --- FUSION AND DISTILLATION LOGIC START ---
             feature_distill_loss = torch.tensor(0.0).to(qpos.device)
             
             if self.fusion_type == 0:
@@ -148,15 +158,12 @@ class DETRVAE(nn.Module):
                 
                 # 1. Compute Teacher features ONLY IF the second camera (crop) is provided
                 if len(all_cam_features) >= 2:
-                    # FIX 1: Removed `with torch.no_grad():` so the Teacher model can actually train!
-                    # (When training the Student Q-Former, the base policy freezes the weights anyway, 
-                    # and the distillation loss uses .detach(), so it's safe to remove this).
                     teacher_src, teacher_pos = self.fusion_block(
                         all_cam_features[0], all_cam_features[1], 
                         all_cam_pos[0], all_cam_pos[1]
                     )
                 
-                # 2. If Q-former is active, proxy feat1 and compute Student's fused features
+                # 2. Branch: Q-Former Student
                 if getattr(self, 'use_qformer', False):
                     bs = image.shape[0]
                     q_feat1 = self.learned_feat1.expand(bs, -1, -1, -1)
@@ -167,37 +174,50 @@ class DETRVAE(nn.Module):
                         all_cam_pos[0], q_pos1
                     )
                     
-                    # 3. Calculate the Distillation Loss ONLY IF Teacher features were computed
                     if len(all_cam_features) >= 2:
-                        # We detach the teacher so gradients only flow into the Q-former
-                        feature_distill_loss = F.mse_loss(student_src, teacher_src.detach())
+                        # Using Cosine Similarity to escape the MSE average trap
+                        cos_sim = F.cosine_similarity(student_src, teacher_src.detach(), dim=1)
+                        feature_distill_loss = (1.0 - cos_sim).mean()
                     
-                    # The rest of the network uses the Student's features
                     src = student_src
                     pos = student_pos
 
-                else: # FIX 2: Corrected indentation to align with `if getattr(self, 'use_qformer', False):`
-                    # Standard inference/training without Q-former (Requires 2 cameras)
-                    assert len(all_cam_features) >= 2, "Need at least 2 cameras for standard fusion without Q-former."
+                # 3. Branch: Implicit Attention Distillation Student
+                elif getattr(self, 'use_implicit_distill', False):
+                    # Pass cam[0] into both sides of the implicit block to act as a self-attention bottleneck
+                    student_src, student_pos = self.implicit_attention_block(
+                        all_cam_features[0], all_cam_features[0], 
+                        all_cam_pos[0], all_cam_pos[0]
+                    )
+                    
+                    if len(all_cam_features) >= 2:
+                        # Using Cosine Similarity to force structural matching
+                        cos_sim = F.cosine_similarity(student_src, teacher_src.detach(), dim=1)
+                        feature_distill_loss = (1.0 - cos_sim).mean()
+                        
+                    src = student_src
+                    pos = student_pos
+
+                # 4. Branch: Standard Baseline / Teacher (No Distillation)
+                else:
+                    assert len(all_cam_features) >= 2, "Need at least 2 cameras for standard fusion without distillation."
                     src = teacher_src
                     pos = teacher_pos
+            # --- FUSION AND DISTILLATION LOGIC END ---
                     
-            hs, attn_weights, = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)
+            hs, attn_weights = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
             transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2
-            # hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
-            hs,attn_weights = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)
-        # --- MODIFICATION START ---   
+            hs, attn_weights = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)
+            feature_distill_loss = torch.tensor(0.0).to(qpos.device) # Fallback for state-only
+            
         hs = hs[0] # Take the output from the last decoder layer
-        # --- MODIFICATION END ---
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
         
         return a_hat, is_pad_hat, [mu, logvar], attn_weights, feature_distill_loss
-
-
 class FusionLayer(nn.Module):
     """ A single layer of Cross-Attention + FFN """
     def __init__(self, d_model, nhead, fusion_type, dim_feedforward=2048, dropout=0.1):
@@ -423,7 +443,8 @@ def build(args):
         camera_names=args.camera_names,
         fusion_type=getattr(args, 'fusion_type', 0),
         num_fusion_layers=getattr(args, 'fusion_layers', 1),
-        use_qformer=getattr(args, 'use_qformer', False)
+        use_qformer=getattr(args, 'use_qformer', False),
+        use_implicit_distill=getattr(args, 'use_implicit_distill', False),
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

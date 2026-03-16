@@ -81,6 +81,30 @@ class ACTPolicyQFormer(ACTPolicy):
             self.model.learned_pos1
         ], lr=args_override['lr'], weight_decay=1e-4)
 
+
+class ACTPolicyImplicitDistill(ACTPolicy):
+    def __init__(self, args_override):
+        # Force the model to use the Implicit Distillation logic
+        args_override['use_implicit_distill'] = True
+        
+        # Initialize the base ACTPolicy
+        super().__init__(args_override)
+        
+        # 1. Freeze all parameters in the network (The Teacher)
+        for param in self.model.parameters():
+            param.requires_grad = False
+            
+        # 2. Unfreeze ONLY the new implicit attention block (The Student)
+        for param in self.model.implicit_attention_block.parameters():
+            param.requires_grad = True
+        
+        # 3. Override the optimizer to only train this specific block
+        self.optimizer = torch.optim.AdamW(
+            self.model.implicit_attention_block.parameters(),
+            lr=args_override['lr'], 
+            weight_decay=1e-4
+        )
+
 class CNNMLPPolicy(nn.Module):
     def __init__(self, args_override):
         super().__init__()
