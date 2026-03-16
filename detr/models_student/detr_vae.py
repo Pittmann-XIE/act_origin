@@ -82,7 +82,6 @@ class DETRVAE(nn.Module):
            nn.Sigmoid()
            )
  
-    # Updated forward method inside DETRVAE in detr_vae.py
     def forward(self, qpos, image, env_state, actions=None, is_pad=None, train_stage=1):
         is_training = actions is not None # train or val
         bs, _ = qpos.shape
@@ -100,8 +99,11 @@ class DETRVAE(nn.Module):
             is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)  
             pos_embed = self.pos_table.clone().detach()
             pos_embed = pos_embed.permute(1, 0, 2)  
-            encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
+            
+            # Unpack the tuple here to prevent the tensor size mismatch error!
+            encoder_output, _ = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
             encoder_output = encoder_output[0] 
+            
             latent_info = self.latent_proj(encoder_output)
             mu = latent_info[:, :self.latent_dim]
             logvar = latent_info[:, self.latent_dim:]
@@ -130,18 +132,25 @@ class DETRVAE(nn.Module):
             src_student = all_cam_features[0]
             pos_student = all_cam_pos[0]
 
+            # ---------------------------------------------------------
+            # THE SINGLE TRANSFORMER CALL BLOCK (No duplicate calls later!)
+            # ---------------------------------------------------------
             if train_stage == 1:
                 hs, attn_weights = self.transformer(
                     src_teacher, None, self.query_embed.weight, pos_teacher, 
                     latent_input, proprio_input, self.additional_pos_embed.weight, train_stage=1
                 )
             elif train_stage == 2:
-                hs, attn_weights, memory_t, memory_s = self.transformer(
+                # Capture all 7 outputs explicitly here
+                hs, attn_weights, memory_t, memory_s, enc_attn_t, enc_attn_s, mimicked_cam1 = self.transformer(
                     src_teacher, None, self.query_embed.weight, pos_teacher, 
                     latent_input, proprio_input, self.additional_pos_embed.weight,
                     src_student=src_student, pos_student=pos_student, train_stage=2
                 )
-            else: # Inference (train_stage = 0)
+                # Capture the real cam1 features to use as the target
+                target_cam1 = all_cam_features[1]
+            else: 
+                # Inference (train_stage = 0)
                 hs, attn_weights = self.transformer(
                     None, None, self.query_embed.weight, None, 
                     latent_input, proprio_input, self.additional_pos_embed.weight,
@@ -158,15 +167,15 @@ class DETRVAE(nn.Module):
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
         
-        # --- FIX: Return conditionally based on train_stage ---
+        # ---------------------------------------------------------
+        # THE RETURN BLOCK
+        # ---------------------------------------------------------
         if train_stage == 1:
-            # Stage 1: policy_student expects 4 outputs
             return a_hat, is_pad_hat, [mu, logvar], attn_weights
         elif train_stage == 2:
-            # Stage 2: policy_student expects 6 outputs (includes memory maps for distillation)
-            return a_hat, is_pad_hat, [mu, logvar], attn_weights, memory_t, memory_s
-        else:
-            # Inference (Stage 0): policy_student expects 4 outputs
+            return a_hat, is_pad_hat, [mu, logvar], attn_weights, memory_t, memory_s, enc_attn_t, enc_attn_s, mimicked_cam1, target_cam1
+        else: 
+            # Inference / Evaluation (train_stage = 0)
             return a_hat, is_pad_hat, [mu, logvar], attn_weights
 
 class CNNMLP(nn.Module):

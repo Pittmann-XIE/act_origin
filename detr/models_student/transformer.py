@@ -1,4 +1,8 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+
+'''
+
+'''
 """
 DETR Transformer class.
 
@@ -51,7 +55,11 @@ class Transformer(nn.Module):
         self.d_model = d_model
         self.nhead = nhead
         
-        self.cam2_mask_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.mimic_cam1 = nn.Sequential(
+                            nn.Conv2d(d_model, d_model, kernel_size=3, padding=1),
+                            nn.ReLU(inplace=True),
+                            nn.Conv2d(d_model, d_model, kernel_size=3, padding=1)
+                    )
 
     def _reset_parameters(self):
         for p in self.parameters():
@@ -63,15 +71,26 @@ class Transformer(nn.Module):
         
         memory_teacher_cam1 = None
         memory_student = None
-        
+        enc_attn_t = None
+        enc_attn_s = None
+        mimicked_cam1 = None
+
         # Prepare Student Input
         if src_student is not None:
-            bs_s, c_s, h_s, w_s = src_student.shape
-            src_s = src_student.flatten(2).permute(2, 0, 1)
-            pos_s = pos_student.flatten(2).permute(2, 0, 1).repeat(1, bs_s, 1)
+            # 1. Hallucinate the missing cam1 features from cam0
+            mimicked_cam1 = self.mimic_cam1(src_student)
+            
+            # 2. Combine them spatially along the width (just like the teacher)
+            src_s_spatial = torch.cat([src_student, mimicked_cam1], dim=3)
+            pos_s_spatial = torch.cat([pos_student, pos_student], dim=3)
+            
+            bs_s = src_s_spatial.shape[0]
+            src_s = src_s_spatial.flatten(2).permute(2, 0, 1)
+            pos_s = pos_s_spatial.flatten(2).permute(2, 0, 1).repeat(1, bs_s, 1)
+            
             pos_s = torch.cat([additional_pos_embed.unsqueeze(1).repeat(1, bs_s, 1), pos_s], axis=0)
             src_s = torch.cat([torch.stack([latent_input, proprio_input], axis=0), src_s], axis=0)
-            
+
         # Prepare Teacher Input
         if src is not None:
             bs, c, h, w_total = src.shape
@@ -83,57 +102,34 @@ class Transformer(nn.Module):
         query_embed = query_embed.unsqueeze(1).repeat(1, bs_s if src_student is not None else bs, 1)
 
         if train_stage == 1:
-            # Stage 1: Standard Teacher
-            memory_to_decode = self.encoder(src_t, src_key_padding_mask=mask, pos=pos_t)
+            memory_to_decode, enc_attn_t = self.encoder(src_t, src_key_padding_mask=mask, pos=pos_t)
             pos_to_decode = pos_t
             
         elif train_stage == 2:
-            # Stage 2: Distillation
             with torch.no_grad(): 
-                memory_teacher = self.encoder(src_t, src_key_padding_mask=mask, pos=pos_t)
+                memory_teacher, enc_attn_t = self.encoder(src_t, src_key_padding_mask=mask, pos=pos_t)
             
-            seq_s, bs_s, _ = src_s.shape
-            missing_len = pos_t.shape[0] - seq_s
-            
-            mask_tokens = self.cam2_mask_token.repeat(missing_len, bs_s, 1)
-            src_s_padded = torch.cat([src_s, mask_tokens], dim=0)
-            
-            memory_student = self.student_encoder(src_s_padded, src_key_padding_mask=mask, pos=pos_t)
+            memory_student, enc_attn_s = self.student_encoder(src_s, src_key_padding_mask=mask, pos=pos_s)
             
             memory_teacher_cam1 = memory_teacher 
             memory_to_decode = memory_student
-            pos_to_decode = pos_t
+            pos_to_decode = pos_s
             
         else:
-            # Stage 0: Inference (Student Only)
-            seq_s, bs_s, _ = src_s.shape
-            
-            # --- THE FIX: Reconstruct pos_t exactly as the teacher saw it ---
-            # pos_student is shape (B, C, H, W). The teacher concatenated two of these along width.
-            pos_teacher_recon = torch.cat([pos_student, pos_student], dim=3)
-            
-            # Now flatten and prepend the latent/proprio embeddings just like Stage 1
-            pos_t = pos_teacher_recon.flatten(2).permute(2, 0, 1).repeat(1, bs_s, 1)
-            pos_t = torch.cat([additional_pos_embed.unsqueeze(1).repeat(1, bs_s, 1), pos_t], axis=0)
-            # ----------------------------------------------------------------
-            
-            missing_len = pos_t.shape[0] - seq_s
-            mask_tokens = self.cam2_mask_token.repeat(missing_len, bs_s, 1)
-            src_s_padded = torch.cat([src_s, mask_tokens], dim=0)
-            
-            memory_to_decode = self.student_encoder(src_s_padded, src_key_padding_mask=mask, pos=pos_t)
-            pos_to_decode = pos_t
+            # Stage 0: Inference
+            memory_to_decode, enc_attn_s = self.student_encoder(src_s, src_key_padding_mask=mask, pos=pos_s)
+            pos_to_decode = pos_s
 
         tgt = torch.zeros_like(query_embed)
         hs, attn_weights = self.decoder(tgt, memory_to_decode, memory_key_padding_mask=mask,
-                          pos=pos_to_decode, query_pos=query_embed)
+                        pos=pos_to_decode, query_pos=query_embed)
         
         hs = hs.transpose(1, 2)
         
         if train_stage == 2:
-            return hs, attn_weights, memory_teacher_cam1, memory_student
+            # Return everything needed for the 3 distillation losses
+            return hs, attn_weights, memory_teacher_cam1, memory_student, enc_attn_t, enc_attn_s, mimicked_cam1
         return hs, attn_weights
-
 class TransformerEncoder(nn.Module):
 
     def __init__(self, encoder_layer, num_layers, norm=None):
@@ -142,21 +138,17 @@ class TransformerEncoder(nn.Module):
         self.num_layers = num_layers
         self.norm = norm
 
-    def forward(self, src,
-                mask: Optional[Tensor] = None,
-                src_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None):
+    def forward(self, src, mask=None, src_key_padding_mask=None, pos=None):
         output = src
-
+        attn_weights_list = []
         for layer in self.layers:
-            output = layer(output, src_mask=mask,
-                           src_key_padding_mask=src_key_padding_mask, pos=pos)
+            output, attn = layer(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask, pos=pos)
+            attn_weights_list.append(attn)
 
         if self.norm is not None:
             output = self.norm(output)
 
-        return output
-
+        return output, attn_weights_list
 
 class TransformerDecoder(nn.Module):
 
@@ -233,20 +225,16 @@ class TransformerEncoderLayer(nn.Module):
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
-    def forward_post(self,
-                     src,
-                     src_mask: Optional[Tensor] = None,
-                     src_key_padding_mask: Optional[Tensor] = None,
-                     pos: Optional[Tensor] = None):
+    def forward_post(self, src, src_mask=None, src_key_padding_mask=None, pos=None):
         q = k = self.with_pos_embed(src, pos)
-        src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
-                              key_padding_mask=src_key_padding_mask)[0]
+        # Capture the second output of self_attn (the weights)
+        src2, attn = self.self_attn(q, k, value=src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)
         src = src + self.dropout1(src2)
         src = self.norm1(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
         src = src + self.dropout2(src2)
         src = self.norm2(src)
-        return src
+        return src, attn
 
     def forward_pre(self, src,
                     src_mask: Optional[Tensor] = None,
