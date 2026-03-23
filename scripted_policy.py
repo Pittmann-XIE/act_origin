@@ -191,4 +191,3 @@ def test_policy(task_name):
 if __name__ == '__main__':
     test_task_name = 'sim_transfer_cube_scripted'
     test_policy(test_task_name)
-

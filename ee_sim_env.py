@@ -155,17 +155,84 @@ class TransferCubeEETask(BimanualViperXEETask):
         super().__init__(random=random)
         self.max_reward = 4
 
+    # def initialize_episode(self, physics):
+    #     """Sets the state of the environment at the start of each episode."""
+    #     self.initialize_robots(physics)
+        
+    #     # 1. Randomize red box position
+    #     cube_pose = sample_box_pose()
+    #     box_jnt_id = physics.model.name2id('red_box_joint', 'joint')
+    #     # Get the CORRECT starting index in qpos (should be 16)
+    #     box_qpos_adr = physics.model.jnt_qposadr[box_jnt_id]
+    #     np.copyto(physics.data.qpos[box_qpos_adr : box_qpos_adr + 7], cube_pose)
+
+    #     # 2. Randomize distractor 1 (Green) safely on left side
+    #     d1_pose = np.array([
+    #         np.random.uniform(-0.35, -0.15),
+    #         np.random.uniform(0.60, 0.70),
+    #         0.05, 1, 0, 0, 0
+    #     ])
+    #     d1_jnt_id = physics.model.name2id('distractor_1_joint', 'joint')
+    #     # Get the CORRECT starting index in qpos (should be 23)
+    #     d1_qpos_adr = physics.model.jnt_qposadr[d1_jnt_id]
+    #     np.copyto(physics.data.qpos[d1_qpos_adr : d1_qpos_adr + 7], d1_pose)
+
+    #     # 3. Randomize distractor 2 (Blue) safely on right side
+    #     d2_pose = np.array([
+    #         np.random.uniform(0.15, 0.35),
+    #         np.random.uniform(0.60, 0.70),
+    #         0.05, 1, 0, 0, 0
+    #     ])
+    #     d2_jnt_id = physics.model.name2id('distractor_2_joint', 'joint')
+    #     # Get the CORRECT starting index in qpos (should be 30)
+    #     d2_qpos_adr = physics.model.jnt_qposadr[d2_jnt_id]
+    #     np.copyto(physics.data.qpos[d2_qpos_adr : d2_qpos_adr + 7], d2_pose)
+
+    #     super().initialize_episode(physics)
+    
     def initialize_episode(self, physics):
         """Sets the state of the environment at the start of each episode."""
         self.initialize_robots(physics)
-        # randomize box position
+        
+        # Helper function to sample poses safely without collision
+        def sample_non_colliding_pose(existing_poses, min_dist=0.06, max_tries=100):
+            for _ in range(max_tries):
+                pose = sample_box_pose()
+                # Check 2D distance (x, y) to all existing boxes
+                collision = False
+                for ep in existing_poses:
+                    dist = np.linalg.norm(pose[:2] - ep[:2])
+                    if dist < min_dist:
+                        collision = True
+                        break
+                
+                # If it's far enough from all other boxes, return this pose
+                if not collision:
+                    return pose
+                    
+            # Fallback if it fails to find a safe spot after max_tries
+            return sample_box_pose()
+
+        # 1. Randomize target red box position
         cube_pose = sample_box_pose()
-        box_start_idx = physics.model.name2id('red_box_joint', 'joint')
-        np.copyto(physics.data.qpos[box_start_idx : box_start_idx + 7], cube_pose)
-        # print(f"randomized cube position to {cube_position}")
+        box_jnt_id = physics.model.name2id('red_box_joint', 'joint')
+        box_qpos_adr = physics.model.jnt_qposadr[box_jnt_id]
+        np.copyto(physics.data.qpos[box_qpos_adr : box_qpos_adr + 7], cube_pose)
+
+        # 2. Randomize distractor 1 (Green) in the same workspace
+        d1_pose = sample_non_colliding_pose([cube_pose])
+        d1_jnt_id = physics.model.name2id('distractor_1_joint', 'joint')
+        d1_qpos_adr = physics.model.jnt_qposadr[d1_jnt_id]
+        np.copyto(physics.data.qpos[d1_qpos_adr : d1_qpos_adr + 7], d1_pose)
+
+        # 3. Randomize distractor 2 (Blue) in the same workspace
+        d2_pose = sample_non_colliding_pose([cube_pose, d1_pose])
+        d2_jnt_id = physics.model.name2id('distractor_2_joint', 'joint')
+        d2_qpos_adr = physics.model.jnt_qposadr[d2_jnt_id]
+        np.copyto(physics.data.qpos[d2_qpos_adr : d2_qpos_adr + 7], d2_pose)
 
         super().initialize_episode(physics)
-
+        
     @staticmethod
     def get_env_state(physics):
         env_state = physics.data.qpos.copy()[16:]

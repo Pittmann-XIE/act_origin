@@ -13,10 +13,9 @@ class ACTPolicy(nn.Module):
         self.model = model # CVAE decoder
         self.optimizer = optimizer
         self.kl_weight = args_override['kl_weight']
-        self.box_weight = args_override.get('box_weight', 1.0)
-        print(f'KL Weight {self.kl_weight} | Box Weight {self.box_weight}')
+        print(f'KL Weight {self.kl_weight}')
 
-    def __call__(self, qpos, image, actions=None, is_pad=None, box_data=None):
+    def __call__(self, qpos, image, actions=None, is_pad=None):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
@@ -25,33 +24,18 @@ class ACTPolicy(nn.Module):
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]
 
-            a_hat, is_pad_hat, (mu, logvar), _, box_hat = self.model(qpos, image, env_state, actions, is_pad)
+            a_hat, is_pad_hat, (mu, logvar),_ = self.model(qpos, image, env_state, actions, is_pad)
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
             all_l1 = F.l1_loss(actions, a_hat, reduction='none')
             l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
             loss_dict['l1'] = l1
             loss_dict['kl'] = total_kld[0]
-            
-            if box_data is not None:
-                # Extract [x, y, w, h] from[class, x, y, w, h]
-                if box_data.dim() == 2 and box_data.shape[-1] == 5:
-                    box_gt = box_data[:, 1:]
-                elif box_data.dim() == 2 and box_data.shape[-1] == 4:
-                    box_gt = box_data
-                else:
-                    box_gt = box_data[..., -4:]
-                
-                box_loss = F.l1_loss(box_hat, box_gt.float())
-                loss_dict['box_loss'] = box_loss
-                loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight + box_loss * self.box_weight
-            else:
-                loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
-                
+            loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
             return loss_dict
         else: # inference time
-            a_hat, _, (_, _), attn_weights, box_hat = self.model(qpos, image, env_state) # no action, sample from prior
-            return a_hat, attn_weights, box_hat
+            a_hat, _, (_, _),attn_weights = self.model(qpos, image, env_state) # no action, sample from prior
+            return a_hat, attn_weights
 
     def configure_optimizers(self):
         return self.optimizer
@@ -64,7 +48,7 @@ class CNNMLPPolicy(nn.Module):
         self.model = model # decoder
         self.optimizer = optimizer
 
-    def __call__(self, qpos, image, actions=None, is_pad=None, box_data=None):
+    def __call__(self, qpos, image, actions=None, is_pad=None):
         env_state = None # TODO
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])

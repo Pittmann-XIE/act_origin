@@ -152,8 +152,7 @@ class DETRVAE(nn.Module):
         # --- MODIFICATION END ---
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
-        box_hat = self.object_detection(hs.mean(dim=1))
-        return a_hat, is_pad_hat, [mu, logvar], attn_weights, box_hat
+        return a_hat, is_pad_hat, [mu, logvar], attn_weights
 
 
 
