@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from .models_student import build_ACT_model, build_CNNMLP_model
+from .models_track import build_ACT_model, build_CNNMLP_model
 
 import IPython
 e = IPython.embed
