@@ -42,9 +42,9 @@ class ACTPolicy(nn.Module):
             loss_dict['kl'] = total_kld[0]
             loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
             
-            # --- MODIFICATION: APPLY GAZE KL DIVERGENCE ---
+            # --- MODIFICATION: SPATIOTEMPORAL POOLED GAZE KL DIVERGENCE ---
             if gaze_data is not None:
-                # 1. Grab specific layer: A shape -> (batch, num_heads, query_length, 2 + 15 * 20 * N)
+                # 1. Grab specific layer's attention weights
                 A = attn_weights_list[self.layer_to_align] 
                 
                 # 2. Slice out the 2 auxiliary tokens (latent and proprio)
@@ -52,29 +52,49 @@ class ACTPolicy(nn.Module):
                 batch, num_heads, query_length, spatial_len = A_vision.shape
                 num_cams = spatial_len // (15 * 20)
                 
-                # 3. Reshape matching the memory layout created by torch.cat(axis=3)
+                # 3. Reshape and Permute to match flattened targets
                 A_vision = A_vision.view(batch, num_heads, query_length, 15, num_cams, 20)
-                
-                # 4. Swap N and Width -> (batch, num_heads, query_length, N, 15, 20) to match flattened target
                 A_vision = A_vision.permute(0, 1, 2, 4, 3, 5)
                 A_vision = A_vision.reshape(batch, num_heads, query_length, num_cams * 15 * 20)
                 
-                # 5. Normalize spatial vectors to sum to 1.0 (Probabilities)
-                A_vision_prob = A_vision / (A_vision.sum(dim=-1, keepdim=True) + 1e-8)
+                # --- FIX 1: MEAN POOLING TO PREVENT COLLAPSE ---
+                # Average the spatial attention across all heads. 
+                # This allows individual heads to specialize, as long as their combined sum matches human gaze.
+                A_vision_pooled = A_vision.mean(dim=1) # Shape: (batch, query_length, 1200)
+                
+                # Normalize inputs and targets (adding epsilon to prevent division by zero)
+                A_vision_prob = A_vision_pooled / (A_vision_pooled.sum(dim=-1, keepdim=True) + 1e-8)
                 gaze_prob = gaze_data / (gaze_data.sum(dim=-1, keepdim=True) + 1e-8)
                 
-                # 6. KL(Target || Pred) requires Pred in Log-Space
+                # Convert model probabilities to Log Space for KL Divergence
                 A_vision_logprob = torch.log(A_vision_prob + 1e-8)
                 
-                # 7. Expand target gaze across all MultiHead Attention heads 
-                gaze_prob_expanded = gaze_prob.unsqueeze(1).expand(-1, num_heads, -1, -1)
+                # --- FIX 2: UNREDUCED LOSS FOR MASKING ---
+                # Calculate raw KL Divergence. reduction='none' prevents PyTorch's batchmean inflation.
+                kl_unreduced = F.kl_div(A_vision_logprob, gaze_prob, reduction='none') # (batch, query_length, 1200)
                 
-                # 8. Compute KL Divergence Loss
-                loss_gaze = F.kl_div(A_vision_logprob, gaze_prob_expanded, reduction='batchmean')
+                # Sum across the spatial dimension to get the total KL penalty per temporal query
+                kl_per_query = kl_unreduced.sum(dim=-1) # Shape: (batch, query_length)
+                
+                # --- FIX 3: COMBINED PADDING MASK ---
+                # We must ignore queries where:
+                # 1. The action is a padded dummy action (is_pad == True)
+                # 2. The human gaze data is entirely missing/empty (sum == 0)
+                valid_gaze_mask = (gaze_data.sum(dim=-1) > 1e-5) # True if gaze exists
+                valid_mask = (~is_pad) & valid_gaze_mask         # True if action is real AND gaze exists
+                
+                # Apply mask to zero out invalid queries
+                kl_masked = kl_per_query * valid_mask
+                
+                # Safely average the loss only over the valid queries in the batch
+                valid_queries_count = valid_mask.sum()
+                loss_gaze = kl_masked.sum() / torch.clamp(valid_queries_count, min=1.0)
+                
+                # Append to dict and scale by user-defined weight
                 loss_dict['gaze'] = loss_gaze
                 loss_dict['loss'] += loss_gaze * self.gaze_weight
-            # ----------------------------------------------
-                
+            # --------------------------------------------------------------
+                            
             return loss_dict
         else: # inference time
             a_hat, is_pad_hat, (mu, logvar), attn_weights_list = self.model(qpos, image, env_state) 

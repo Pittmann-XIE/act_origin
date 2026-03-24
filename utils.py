@@ -43,7 +43,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
             #     image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
             for cam_name in self.camera_names:
                 if cam_name=='top_cropped_1':
-                    img = root[f'/observations/images/{cam_name}'][0]
+                    img = root[f'/observations/images/{cam_name}'][start_ts]
                 else:
                     img = root[f'/observations/images/{cam_name}'][start_ts]
                 if img.shape[0] != 480 or img.shape[1] != 640:
