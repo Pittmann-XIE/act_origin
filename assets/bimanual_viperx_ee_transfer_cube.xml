@@ -2,6 +2,10 @@
     <include file="scene.xml"/>
     <include file="vx300s_dependencies.xml"/>
 
+    <asset>
+        <mesh name="hex_prism" vertex="0.03 0 0.03  0.015 0.02598 0.03  -0.015 0.02598 0.03  -0.03 0 0.03  -0.015 -0.02598 0.03  0.015 -0.02598 0.03  0.03 0 -0.03  0.015 0.02598 -0.03  -0.015 0.02598 -0.03  -0.03 0 -0.03  -0.015 -0.02598 -0.03  0.015 -0.02598 -0.03"/>
+    </asset>
+
     <equality>
         <weld body1="mocap_left" body2="vx300s_left/gripper_link" solref="0.01 1" solimp=".25 .25 0.001" />
         <weld body1="mocap_right" body2="vx300s_right/gripper_link" solref="0.01 1" solimp=".25 .25 0.001" />
@@ -32,13 +36,29 @@
         <body name="distractor_1" pos="0.35 0.5 0.05">
             <joint name="distractor_1_joint" type="free" frictionloss="0.01" />
             <inertial pos="0 0 0" mass="0.05" diaginertia="0.002 0.002 0.002" />
+            <!-- <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.02 0.02 0.02" type="box" name="distractor_1_geom" rgba="0 0 1 1" /> -->
             <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.02 0.02 0.02" type="box" name="distractor_1_geom" rgba="0.941 0.024 0.871 1" />
+            <!-- <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.02 0.02 0.02" type="box" name="distractor_1_geom" rgba="1 0.502 0 1" /> -->
+            <!-- <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" type="mesh" mesh="hex_prism" name="distractor_1_geom" rgba="0.941 0.024 0.871 1" /> -->
+            <!-- <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" type="mesh" mesh="hex_prism" name="distractor_1_geom" rgba="1 0.502 0 1" /> -->
         </body>
 
         <body name="distractor_2" pos="0.1 0.5 0.05">
             <joint name="distractor_2_joint" type="free" frictionloss="0.01" />
             <inertial pos="0 0 0" mass="0.05" diaginertia="0.002 0.002 0.002" />
+            <!-- <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.015 0.03 0.015" type="box" name="distractor_2_geom" rgba="1 0 0 1" /> -->
             <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.015 0.03 0.015" type="box" name="distractor_2_geom" rgba="0.804 0.941 0.024 1" />
+            <!-- <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.015 0.03 0.015" type="box" name="distractor_2_geom" rgba="0 1 1 1" /> -->
+            <!-- <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.015 0.04 0.015" type="box" name="distractor_2_geom" rgba="0.804 0.941 0.024 1" /> -->
+        </body>
+
+        <body name="distractor_3" pos="0.1 0.5 0.05">
+            <joint name="distractor_3_joint" type="free" frictionloss="0.01" />
+            <inertial pos="0 0 0" mass="0.05" diaginertia="0.002 0.002 0.002" />
+            <!-- <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.015 0.03 0.015" type="box" name="distractor_2_geom" rgba="1 0 0 1" /> -->
+            <!-- <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.015 0.03 0.015" type="box" name="distractor_2_geom" rgba="0.804 0.941 0.024 1" /> -->
+            <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.015 0.04 0.015" type="box" name="distractor_3_geom" rgba="0.804 0.941 0.024 0" />
+            <!-- <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.015 0.03 0.015" type="box" name="distractor_2_geom" rgba="0 1 1 1" /> -->
         </body>
 
     </worldbody>
@@ -53,7 +73,7 @@
     </actuator>
 
     <keyframe>
-        <key qpos="0 -0.96 1.16 0 -0.3 0 0.024 -0.024  0 -0.96 1.16 0 -0.3 0 0.024 -0.024  0.2 0.5 0.05 1 0 0 0  0.1 0.4 0.05 1 0 0 0  0.3 0.6 0.05 1 0 0 0"/>
+        <key qpos="0 -0.96 1.16 0 -0.3 0 0.024 -0.024  0 -0.96 1.16 0 -0.3 0 0.024 -0.024  0.2 0.5 0.05 1 0 0 0  0.1 0.4 0.05 1 0 0 0  0.3 0.6 0.05 1 0 0 0  0.1 0.5 0.05 1 0 0 0"/>
     </keyframe>
 
 

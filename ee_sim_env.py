@@ -16,6 +16,8 @@ from dm_control.suite import base
 import IPython
 e = IPython.embed
 
+BOX_COLOR = [None]
+
 
 def make_ee_sim_env(task_name):
     """
@@ -141,6 +143,9 @@ class BimanualViperXEETask(base.Task):
         # used in scripted policy to obtain starting pose
         obs['mocap_pose_left'] = np.concatenate([physics.data.mocap_pos[0], physics.data.mocap_quat[0]]).copy()
         obs['mocap_pose_right'] = np.concatenate([physics.data.mocap_pos[1], physics.data.mocap_quat[1]]).copy()
+        
+        obs['images']['left_wrist'] = physics.render(height=480, width=640, camera_id='left_wrist')
+        obs['images']['right_wrist'] = physics.render(height=480, width=640, camera_id='right_wrist')
 
         # used when replaying joint trajectory
         obs['gripper_ctrl'] = physics.data.ctrl.copy()
@@ -194,6 +199,12 @@ class TransferCubeEETask(BimanualViperXEETask):
         """Sets the state of the environment at the start of each episode."""
         self.initialize_robots(physics)
         
+        # --- ADD THESE 3 LINES ---
+        if BOX_COLOR[0] is not None:
+            geom_id = physics.model.name2id('red_box', 'geom')
+            physics.model.geom_rgba[geom_id] = BOX_COLOR[0]
+        # -------------------------
+        
         # Helper function to sample poses safely without collision
         def sample_non_colliding_pose(existing_poses, min_dist=0.06, max_tries=100):
             for _ in range(max_tries):
@@ -230,6 +241,12 @@ class TransferCubeEETask(BimanualViperXEETask):
         d2_jnt_id = physics.model.name2id('distractor_2_joint', 'joint')
         d2_qpos_adr = physics.model.jnt_qposadr[d2_jnt_id]
         np.copyto(physics.data.qpos[d2_qpos_adr : d2_qpos_adr + 7], d2_pose)
+        
+        # 4. ADDED: Randomize distractor 3
+        d3_pose = sample_non_colliding_pose([cube_pose, d1_pose, d2_pose])
+        d3_jnt_id = physics.model.name2id('distractor_3_joint', 'joint')
+        d3_qpos_adr = physics.model.jnt_qposadr[d3_jnt_id]
+        np.copyto(physics.data.qpos[d3_qpos_adr : d3_qpos_adr + 7], d3_pose)
 
         super().initialize_episode(physics)
         
@@ -273,6 +290,13 @@ class InsertionEETask(BimanualViperXEETask):
     def initialize_episode(self, physics):
         """Sets the state of the environment at the start of each episode."""
         self.initialize_robots(physics)
+        
+        # --- FIX: ADD COLOR RANDOMIZATION SUPPORT FOR INSERTION ---
+        if BOX_COLOR[0] is not None:
+            geom_id = physics.model.name2id('red_peg', 'geom')
+            physics.model.geom_rgba[geom_id] = BOX_COLOR[0]
+        # ----------------------------------------------------------
+
         # randomize peg and socket position
         peg_pose, socket_pose = sample_insertion_pose()
         id2index = lambda j_id: 16 + (j_id - 16) * 7 # first 16 is robot qpos, 7 is pose dim # hacky

@@ -16,6 +16,7 @@ import IPython
 e = IPython.embed
 
 BOX_POSE = [None] # to be changed from outside
+BOX_COLOR = [None] # <--- ADD THIS
 
 def make_sim_env(task_name):
     """
@@ -110,6 +111,9 @@ class BimanualViperXTask(base.Task):
         obs['images']['top'] = physics.render(height=480, width=640, camera_id='top')
         obs['images']['angle'] = physics.render(height=480, width=640, camera_id='angle')
         obs['images']['vis'] = physics.render(height=480, width=640, camera_id='front_close')
+        
+        obs['images']['left_wrist'] = physics.render(height=480, width=640, camera_id='left_wrist')
+        obs['images']['right_wrist'] = physics.render(height=480, width=640, camera_id='right_wrist')
 
         return obs
 
@@ -131,7 +135,15 @@ class TransferCubeTask(BimanualViperXTask):
             assert BOX_POSE[0] is not None
             
             # Load the 21 box/distractor coordinates dynamically starting at index 16
-            physics.data.qpos[16:37] = BOX_POSE[0] 
+            # physics.data.qpos[16:37] = BOX_POSE[0] # 2 distractors
+            physics.data.qpos[16:44] = BOX_POSE[0] 
+            
+            # --- ADD THESE 3 LINES ---
+            if BOX_COLOR[0] is not None:
+                geom_id = physics.model.name2id('red_box', 'geom')
+                physics.model.geom_rgba[geom_id] = BOX_COLOR[0]
+            # -------------------------
+            
             
         super().initialize_episode(physics)
         
@@ -180,8 +192,13 @@ class InsertionTask(BimanualViperXTask):
             physics.named.data.qpos[:16] = START_ARM_POSE
             np.copyto(physics.data.ctrl, START_ARM_POSE)
             assert BOX_POSE[0] is not None
-            physics.named.data.qpos[-7*2:] = BOX_POSE[0] # two objects
-            # print(f"{BOX_POSE=}")
+            physics.data.qpos[16:] = BOX_POSE[0]
+            
+            if BOX_COLOR[0] is not None:
+                # FIX: Change 'red_box' to 'red_peg'
+                geom_id = physics.model.name2id('red_peg', 'geom')
+                physics.model.geom_rgba[geom_id] = BOX_COLOR[0]
+            
         super().initialize_episode(physics)
 
     @staticmethod
