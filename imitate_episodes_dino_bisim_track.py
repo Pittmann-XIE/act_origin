@@ -225,13 +225,32 @@ def eval_bc(config, ckpt_name, save_episode=True):
         rewards = np.array(rewards)
         episode_return = np.sum(rewards[rewards!=None])
         episode_returns.append(episode_return)
-        highest_rewards.append(np.max(rewards))
+        
+        episode_highest_reward = np.max(rewards)
+        highest_rewards.append(episode_highest_reward)
+        print(f'Rollout {rollout_id+1}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
+
         if save_episode: save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id+1}.mp4'))
 
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
-    with open(os.path.join(ckpt_dir, f'result_{ckpt_name.split(".")[0]}.txt'), 'w') as f:
-        f.write(f'Success rate: {success_rate}\nAverage return: {avg_return}\n\n')
+    
+    summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'
+    for r in range(env_max_reward+1):
+        more_or_equal_r = (np.array(highest_rewards) >= r).sum()
+        more_or_equal_r_rate = more_or_equal_r / num_rollouts
+        summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n'
+
+    print(summary_str)
+
+    # save success rate to txt
+    result_file_name = 'result_' + ckpt_name.split('.')[0] + '.txt'
+    with open(os.path.join(ckpt_dir, result_file_name), 'w') as f:
+        f.write(summary_str)
+        f.write(repr(episode_returns))
+        f.write('\n\n')
+        f.write(repr(highest_rewards))
+
     return success_rate, avg_return
 
 def forward_pass(data, policy, device='cuda'): 
