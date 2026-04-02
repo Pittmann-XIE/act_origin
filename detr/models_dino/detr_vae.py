@@ -126,7 +126,7 @@ class DETRVAE(nn.Module):
                 if len(out) == 3:
                     features, pos, cls_token = out
                     all_cls_tokens.append(cls_token)
-                    print(f'backbone out shape: {features[0].shape}')
+
                     
                 else:
                     features, pos = out
