@@ -21,6 +21,26 @@ from sim_env import BOX_POSE
 import IPython
 e = IPython.embed
 
+def update_mujoco_lighting(env, timestep, mode='dynamic'):
+    """Modifies the MuJoCo lighting on the fly."""
+    if not hasattr(env, '_physics') or env._physics is None:
+        return
+        
+    physics = env._physics
+    
+    if mode == 'dynamic':
+        # Oscillate brightness using a sine wave
+        brightness_scalar = 0.5 + 0.4 * np.sin(timestep * 0.05) 
+    elif mode == 'random':
+        # Apply a random jitter every step
+        brightness_scalar = np.random.uniform(0.2, 0.9)
+    else:
+        return
+
+    # Apply to ambient and diffuse lighting (Shape is (nlight, 3))
+    physics.model.light_ambient[0] = np.array([brightness_scalar, brightness_scalar, brightness_scalar])
+
+
 def main(args):
     set_seed(1)
     # command line parameters
@@ -52,6 +72,9 @@ def main(args):
     lr_backbone = 1e-5
     backbone = args.get('backbone', 'resnet18')  # Updated mapping
     dinov3_downsample = args.get('dinov3_downsample', False)
+    # --- UPDATE THIS LINE ---
+    lr_backbone = 1e-5 if backbone != 'dinov3' else 0.0
+    # ------------------------
     
     if policy_class == 'ACT':
         enc_layers = 4
@@ -226,11 +249,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
             p_red = sample_box_pose()
             p_dist1 = sample_non_colliding_pose([p_red])
             p_dist2 = sample_non_colliding_pose([p_red, p_dist1])
-            
+            p_dist3 = sample_non_colliding_pose([p_red, p_dist1, p_dist2])      
             # Concatenate all 3 poses into a single array of length 21
-            BOX_POSE[0] = np.concatenate([p_red, p_dist1, p_dist2]) 
+            # BOX_POSE[0] = np.concatenate([p_red, p_dist1, p_dist2]) 
+            BOX_POSE[0] = np.concatenate([p_red, p_dist1, p_dist2, p_dist3])
             # ---------------------------------------
-            
         elif 'sim_insertion' in task_name:
             BOX_POSE[0] = np.concatenate(sample_insertion_pose()) 
 
@@ -463,7 +486,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
     
     # NEW ARGUMENT FOR DEVICE
-    parser.add_argument('--device', action='store', type=str, default='cuda:1', help='Device to use (e.g. cuda:0, cuda:1, cpu)')
+    parser.add_argument('--device', action='store', type=str, default='cuda:0', help='Device to use (e.g. cuda:0, cuda:1, cpu)')
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
@@ -472,6 +495,6 @@ if __name__ == '__main__':
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
     parser.add_argument('--backbone', action='store', type=str, default='dinov3', help='Vision backbone (e.g., resnet18, dinov3)')
-    parser.add_argument('--dinov3_downsample', action='store_true', help='Downsample DINOv3 features to 20x15')
+    parser.add_argument('--dinov3_downsample', action='store_true', help='Downsample DINOv3 features to 20x15', default=True)
     
     main(vars(parser.parse_args()))
