@@ -17,7 +17,7 @@ class ACTPolicy(nn.Module):
         self.bisim_weight = args_override.get('bisim_weight', 1.0)
         print(f'KL Weight {self.kl_weight}, Bisim Weight {self.bisim_weight}')
 
-    def __call__(self, qpos, image, actions=None, is_pad=None, next_qpos=None, next_image=None, valid_next=None):
+    def __call__(self, qpos, image, actions=None, is_pad=None, next_qpos=None, next_image=None, valid_next=None, sampled_ks=None):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
@@ -27,7 +27,7 @@ class ACTPolicy(nn.Module):
             is_pad = is_pad[:, :self.model.num_queries]
 
             a_hat, is_pad_hat, (mu, logvar), _, bisim_loss = self.model(
-                qpos, image, env_state, actions, is_pad, next_qpos, next_image, valid_next
+                qpos, image, env_state, actions, is_pad, next_qpos, next_image, valid_next, sampled_ks
             )
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()

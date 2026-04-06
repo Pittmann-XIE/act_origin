@@ -97,8 +97,7 @@ class DETRVAE(nn.Module):
         self.num_jump_samples = num_jump_samples # <--- Store
         self.decay_gamma = decay_gamma           # <--- Store
  
-
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None, next_qpos=None, next_image=None, valid_next=None):
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, next_qpos=None, next_image=None, valid_next=None, sampled_ks=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -173,57 +172,48 @@ class DETRVAE(nn.Module):
         # Bisimulation Forward Dynamics (Ablation A)
         # ==========================================================
         bisim_loss = None
-        if actions is not None and next_qpos is not None and next_image is not None:
+        if actions is not None and next_qpos is not None and next_image is not None and sampled_ks is not None:
             bs = a_hat.shape[0]
             
             phi_global_current = memory.mean(dim=0) # [Batch, Dim]
             z_theta_current = self.bisim_projection_head(phi_global_current)
             
-            num_samples = getattr(self, 'num_jump_samples')
-            decay_gamma = getattr(self, 'decay_gamma')
-            actual_samples = min(num_samples, self.num_queries)
+            num_samples = sampled_ks.shape[1]
             
-            # --- FIX 2: THE ANCHOR STEP ---
-            # Always sample k=0 to guarantee at least one valid step for almost all trajectories.
-            # Randomly sample the remaining (K-1) steps from the rest of the chunk.
-            # num_random_samples = max(0, actual_samples - 1)
-            # if self.num_queries > 1 and num_random_samples > 0:
-            #     random_ks = torch.randperm(self.num_queries - 1, device=qpos.device)[:num_random_samples] + 1
-            #     sampled_ks = torch.cat([torch.tensor([0], device=qpos.device), random_ks])
-            # else:
-            #     sampled_ks = torch.tensor([0], device=qpos.device)
-
-            actual_k_limit = min(self.num_jump_samples, self.num_queries)
-            sampled_ks = torch.arange(actual_k_limit, device=qpos.device)
-            # --- FIX 1: PER-TRAJECTORY ACCUMULATION TENSORS ---
             total_weighted_loss = torch.zeros(bs, device=qpos.device) # [Batch]
             weight_sum = torch.zeros(bs, device=qpos.device)          # [Batch]
             
-            for k_tensor in sampled_ks:
-                k = k_tensor.item()
+            # Loop over the feature dimension, NOT the k value
+            for idx in range(num_samples):
+                k_batch = sampled_ks[:, idx] # Shape: [Batch]
                 
-                # Action Masking 
+                # --- Vectorized Action Masking ---
                 if getattr(self, 'use_a_hat', False):
                     source_actions = a_hat.detach() 
                 else:
                     source_actions = actions 
                     
+                # Create a mask of shape [Batch, num_queries]. True if step <= k for that trajectory.
+                seq_idx = torch.arange(self.num_queries, device=qpos.device).unsqueeze(0)
+                mask = seq_idx <= k_batch.unsqueeze(1)
+                
                 masked_actions = source_actions.clone()
-                if k + 1 < self.num_queries:
-                    masked_actions[:, k+1:, :] = 0.0 
+                # Use masked_fill_ which correctly broadcasts the [Batch, Seq, 1] mask 
+                # across the [Batch, Seq, Action_Dim] tensor
+                masked_actions.masked_fill_(~mask.unsqueeze(-1), 0.0) 
                 masked_actions_flat = masked_actions.view(bs, -1)
                 
                 # Predict Jump State z_{t+k}
-                k_embed_input = torch.tensor([k], device=qpos.device).expand(bs)
-                k_embed = self.time_embed(k_embed_input)
+                k_embed = self.time_embed(k_batch) # PyTorch handles the [Batch] shape automatically
                 
                 dynamics_input = torch.cat([z_theta_current, masked_actions_flat, k_embed], dim=-1)
                 pred_z_theta_next = self.jump_forward_dynamics(dynamics_input)
                 
                 # Target Network logic
                 with torch.no_grad():
-                    target_image = next_image[:, k] 
-                    target_qpos = next_qpos[:, k]   
+                    # Simply pull the pre-sampled targets!
+                    target_image = next_image[:, idx] 
+                    target_qpos = next_qpos[:, idx]   
                     
                     all_cam_features_next = []
                     all_cam_pos_next = []
@@ -250,27 +240,23 @@ class DETRVAE(nn.Module):
                     
                 # Compute Step Loss
                 raw_bisim_loss = F.mse_loss(pred_z_theta_next, target_z_theta_next, reduction='none').mean(dim=-1) # [Batch]
-                valid_mask = valid_next[:, k] # [Batch]
+                valid_mask = valid_next[:, idx] # [Batch]
                 
-                temporal_weight = decay_gamma ** k 
+                # Vectorized temporal weight
+                temporal_weight = getattr(self, 'decay_gamma') ** k_batch.float()
                 
-                # Accumulate ONLY for valid trajectories
                 total_weighted_loss += raw_bisim_loss * valid_mask * temporal_weight
                 weight_sum += valid_mask * temporal_weight
 
-            # Normalize safely per trajectory
-            # Clamp prevents division by zero (NaN) if a trajectory was 100% invalid
+            # Normalize and combine as before
             per_trajectory_loss = total_weighted_loss / weight_sum.clamp(min=1e-6)
-            
-            # Identify which trajectories actually had at least one valid step
             trajectory_has_valid_step = (weight_sum > 0).float()
-            
-            # Final scalar loss: average only across the valid trajectories in the batch
             valid_trajectory_count = trajectory_has_valid_step.sum()
+            
             if valid_trajectory_count > 0:
                 bisim_loss = (per_trajectory_loss * trajectory_has_valid_step).sum() / valid_trajectory_count
             else:
-                bisim_loss = total_weighted_loss.sum() # Absolute fallback, should never trigger due to k=0
+                bisim_loss = total_weighted_loss.sum() 
 
         return a_hat, is_pad_hat, [mu, logvar], attn_weights, bisim_loss
 

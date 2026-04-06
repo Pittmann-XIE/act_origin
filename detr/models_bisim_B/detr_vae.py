@@ -90,8 +90,7 @@ class DETRVAE(nn.Module):
             nn.Linear(512, num_queries * state_dim) # Outputs flattened action chunk
         )
  
-
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None, next_qpos=None, next_image=None, valid_next=None):
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, target_qpos=None, target_image=None, valid_target=None, k=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -100,6 +99,7 @@ class DETRVAE(nn.Module):
         """
         is_training = actions is not None # train or val
         bs, _ = qpos.shape
+        
         ### Obtain latent z from action sequence
         if is_training:
             # project action sequence to embedding dim, and concat with a CLS token
@@ -144,45 +144,39 @@ class DETRVAE(nn.Module):
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
-            # hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+            
             # --- MODIFICATION START ---
-            hs, attn_weights,memory = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)
-            # hs = hs[0] # Original code might have done this, we unpack tuple now
+            hs, attn_weights, memory = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)
             # --- MODIFICATION END ---
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
             transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2
-            # hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
-            hs,attn_weights = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)
+            
+            hs, attn_weights = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)
+            memory = None # Handle fallback if memory isn't returned
+            
         # --- MODIFICATION START ---   
         hs = hs[-1] # Take the output from the last decoder layer
         # --- MODIFICATION END ---
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
         
-        
         # ==========================================================
         # Bisimulation Inverse Dynamics (Executed only during training)
         # ==========================================================
         bisim_loss = None
-        if actions is not None and next_qpos is not None and next_image is not None:
+        
+        # FIXED: Use the new argument names!
+        if actions is not None and target_qpos is not None and target_image is not None and valid_target is not None and k is not None:
             bs = a_hat.shape[0]
             chunk_size = self.num_queries
             action_dim = a_hat.shape[-1]
             
-            # 1. Sample k 
-            k = np.random.randint(0, chunk_size)
-            
-            # 2. Extract Current Intention-Conditioned State (z_t)
-            phi_global_current = memory.mean(dim=0) # [Batch, Dim]
+            phi_global_current = memory.mean(dim=0)
             z_t = self.bisim_projection_head(phi_global_current) 
             
-            # 3. Target Encoding (No Grad)
             with torch.no_grad():
-                target_image = next_image[:, k]
-                target_qpos = next_qpos[:, k]
-                
                 all_cam_features_target = []
                 all_cam_pos_target = []
                 for cam_id, cam_name in enumerate(self.camera_names):
@@ -206,31 +200,29 @@ class DETRVAE(nn.Module):
                 phi_global_target = memory_target.mean(dim=0)
                 target_z_tk = self.bisim_projection_head(phi_global_target).detach()
                 
-            # 4. Predict Inverse Dynamics Actions
             inv_input = torch.cat([z_t, target_z_tk], dim=-1)
             pred_a_flat = self.inverse_dynamics_model(inv_input)
             pred_a = pred_a_flat.view(bs, chunk_size, action_dim)
             
-            # 5. Masking and Loss Calculation
-            pred_a_k = pred_a[:, :k+1, :]
-            true_a_k = actions[:, :k+1, :]
+            # --- OPTIMIZED VARIABLE k MASKING ---
+            # Calculate loss over the whole chunk
+            raw_bisim_loss = F.mse_loss(pred_a, actions, reduction='none').mean(dim=-1) # [Batch, chunk_size]
             
-            raw_bisim_loss = F.mse_loss(pred_a_k, true_a_k, reduction='none').mean(dim=-1) # [Batch, k+1]
+            # Create a mask where True means index <= k
+            seq_idx = torch.arange(chunk_size, device=qpos.device).unsqueeze(0) # [1, chunk_size]
+            k_mask = seq_idx <= k.unsqueeze(1) # [Batch, chunk_size]
             
-            # Note: `is_pad` is prepended with [CLS] and [QPOS] tokens at the top of this forward pass.
-            # We skip the first 2 indices to align the mask exactly with the action sequence.
-            pad_mask = ~is_pad[:, 2:2+k+1] 
+            # Combine k_mask with padding mask
+            pad_mask = ~is_pad[:, 2:2+chunk_size] # [Batch, chunk_size]
+            final_mask = k_mask & pad_mask
             
-            # Average the loss strictly over the valid (unpadded) steps in our k+1 slice
-            masked_loss = (raw_bisim_loss * pad_mask).sum(dim=1) / pad_mask.sum(dim=1).clamp(min=1)
+            # Average loss strictly over the valid (unpadded AND <= k) steps
+            masked_loss = (raw_bisim_loss * final_mask).sum(dim=1) / final_mask.sum(dim=1).clamp(min=1)
             
-            # Handle episode termination padding using valid_next
-            valid_k = valid_next[:, k]
-            bisim_loss = (masked_loss * valid_k).sum() / valid_k.sum().clamp(min=1)
+            # Apply valid_target (in case episode ended before start_ts + k)
+            bisim_loss = (masked_loss * valid_target).sum() / valid_target.sum().clamp(min=1)
 
         return a_hat, is_pad_hat, [mu, logvar], attn_weights, bisim_loss
-
-
 
 class CNNMLP(nn.Module):
     def __init__(self, backbones, state_dim, camera_names):

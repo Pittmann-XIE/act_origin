@@ -130,7 +130,7 @@ def main(args):
 
     chunk_size = policy_config.get('num_queries', 1) 
     train_dataloader, val_dataloader, stats, _ = load_data(
-        dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, chunk_size
+        dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, chunk_size, policy_config.get('num_jump_samples', 3)
     )
 
     # save dataset stats
@@ -383,11 +383,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 
 def forward_pass(data, policy, device='cuda'):
-    if len(data) == 8: # Contains Bisimulation t+1 data
-        image_data, qpos_data, action_data, is_pad, box_data, image_data_next, qpos_data_next, valid_next = data
+    if len(data) == 9: # Now contains 9 items
+        image_data, qpos_data, action_data, is_pad, box_data, image_data_next, qpos_data_next, valid_next, sampled_ks = data
         image_data, qpos_data, action_data, is_pad = image_data.to(device), qpos_data.to(device), action_data.to(device), is_pad.to(device)
-        image_data_next, qpos_data_next, valid_next = image_data_next.to(device), qpos_data_next.to(device), valid_next.to(device)
-        return policy(qpos_data, image_data, action_data, is_pad, next_qpos=qpos_data_next, next_image=image_data_next, valid_next=valid_next)
+        image_data_next, qpos_data_next, valid_next, sampled_ks = image_data_next.to(device), qpos_data_next.to(device), valid_next.to(device), sampled_ks.to(device)
+        return policy(qpos_data, image_data, action_data, is_pad, next_qpos=qpos_data_next, next_image=image_data_next, valid_next=valid_next, sampled_ks=sampled_ks)
     elif len(data) == 5:
         # Fallback for your YOLO inference logic
         image_data, qpos_data, action_data, is_pad, box_data = data

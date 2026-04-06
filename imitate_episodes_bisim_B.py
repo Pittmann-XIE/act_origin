@@ -63,7 +63,7 @@ def main(args):
     else:
         from aloha_scripts.constants import TASK_CONFIGS
         task_config = TASK_CONFIGS[task_name]
-    dataset_dir = '/tmp/sim_cube_dataset'
+    dataset_dir = task_config['dataset_dir']
     num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
@@ -377,21 +377,39 @@ def eval_bc(config, ckpt_name, save_episode=True):
     return success_rate, avg_return
 
 
-
 def forward_pass(data, policy, device='cuda'):
-    if len(data) == 8: # Contains Bisimulation t+1 data
-        image_data, qpos_data, action_data, is_pad, box_data, image_data_next, qpos_data_next, valid_next = data
-        image_data, qpos_data, action_data, is_pad = image_data.to(device), qpos_data.to(device), action_data.to(device), is_pad.to(device)
-        image_data_next, qpos_data_next, valid_next = image_data_next.to(device), qpos_data_next.to(device), valid_next.to(device)
-        return policy(qpos_data, image_data, action_data, is_pad, next_qpos=qpos_data_next, next_image=image_data_next, valid_next=valid_next)
-    elif len(data) == 5:
-        # Fallback for your YOLO inference logic
-        image_data, qpos_data, action_data, is_pad, box_data = data
+    if len(data) == 9: # Contains Bisimulation target data + k
+        image_data, qpos_data, action_data, is_pad, box_data, target_image, target_qpos, valid_target, k = data
+        
+        # Move inputs to device
         image_data = image_data.to(device)
         qpos_data = qpos_data.to(device)
         action_data = action_data.to(device)
         is_pad = is_pad.to(device)
+        
+        # Move target/bisim inputs to device
+        target_image = target_image.to(device)
+        target_qpos = target_qpos.to(device)
+        valid_target = valid_target.to(device)
+        k = k.to(device)
+        
+        # Pass to policy (make sure kwargs match what we set in ACTPolicy.__call__)
+        return policy(qpos_data, image_data, action_data, is_pad, target_qpos=target_qpos, target_image=target_image, valid_target=valid_target, k=k)
+        
+    elif len(data) == 5:
+        # Fallback for your YOLO inference logic
+        image_data, qpos_data, action_data, is_pad, box_data = data
+        
+        image_data = image_data.to(device)
+        qpos_data = qpos_data.to(device)
+        action_data = action_data.to(device)
+        is_pad = is_pad.to(device)
+        
         return policy(qpos_data, image_data, action_data, is_pad)
+        
+    else:
+        # Catch unexpected data lengths to prevent silent 'None' returns
+        raise ValueError(f"Unexpected data length from DataLoader: {len(data)}. Expected 5 or 9.")
 
 
 def train_bc(train_dataloader, val_dataloader, config):
