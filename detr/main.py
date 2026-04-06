@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from .models_track import build_ACT_model, build_CNNMLP_model
+from .models_bisim_B import build_ACT_model, build_CNNMLP_model
 
 import IPython
 e = IPython.embed
@@ -80,7 +80,8 @@ def build_ACT_model_and_optimizer(args_override):
     print('args: ', args)
 
     model = build_ACT_model(args)
-    model.cuda()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
@@ -103,7 +104,8 @@ def build_CNNMLP_model_and_optimizer(args_override):
         setattr(args, k, v)
 
     model = build_CNNMLP_model(args)
-    model.cuda()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
