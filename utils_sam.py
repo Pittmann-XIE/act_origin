@@ -55,9 +55,12 @@ def generate_gaze_heatmap(points, reward, camera_names, sigma=1.0):
             y_feat = y_raw * (H_feat / H_img)
             
             squared_dist = (x_map - x_feat)**2 + (y_map - y_feat)**2
-            gaussian_2d = weights[pt_idx] * torch.exp(-squared_dist / (2 * sigma**2))
             
-            # Use maximum to prevent additive overlapping (like we did in the visualizer)
+            # Since we only pass 1 point (YOLO center), it will use weights[0]
+            weight = weights[pt_idx] if pt_idx < len(weights) else 1.0
+            gaussian_2d = weight * torch.exp(-squared_dist / (2 * sigma**2))
+            
+            # Use maximum to prevent additive overlapping
             cam_heatmap = torch.maximum(cam_heatmap, gaussian_2d)
             
     G_target[cam_idx] = cam_heatmap
@@ -67,13 +70,13 @@ def generate_gaze_heatmap(points, reward, camera_names, sigma=1.0):
 
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, chunk_size): # <-- ADD chunk_size
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, chunk_size):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
         self.norm_stats = norm_stats
-        self.chunk_size = chunk_size # <-- SAVE IT
+        self.chunk_size = chunk_size
         self.is_sim = None
         self.__getitem__(0)
 
@@ -109,22 +112,18 @@ class EpisodicDataset(torch.utils.data.Dataset):
                     img = cv2.resize(img, (640, 480), interpolation=cv2.INTER_AREA)
                 image_dict[cam_name] = img
                 
-            # get all actions and gaze targets after and including start_ts
+            # get all actions and rewards after and including start_ts
             if is_sim:
                 action = root['/action'][start_ts:]
                 action_len = episode_len - start_ts
                 
-                # Fetch sequence of attention points and rewards for the future k steps
-                if '/observations/attention_2d' in root and '/reward' in root:
-                    attention_seq = root['/observations/attention_2d'][start_ts:]
+                if '/reward' in root:
                     reward_seq = root['/reward'][start_ts:]
                 else:
-                    attention_seq = None
                     reward_seq = None
             else:
                 action = root['/action'][max(0, start_ts - 1):] 
                 action_len = episode_len - max(0, start_ts - 1) 
-                attention_seq = None
                 reward_seq = None
 
         self.is_sim = is_sim
@@ -133,29 +132,36 @@ class EpisodicDataset(torch.utils.data.Dataset):
         is_pad = np.zeros(episode_len)
         is_pad[action_len:] = 1
 
-        # Process sequence of Gaze Heatmaps
+        # Process sequence of Gaze Heatmaps using YOLO bounding box centers
         gaze_heatmaps = []
         for t in range(self.chunk_size): 
-            if attention_seq is not None and t < action_len:
-                hm = generate_gaze_heatmap(attention_seq[t], reward_seq[t], self.camera_names, sigma=1.0)
-            else:
-                hm = torch.zeros(len(self.camera_names) * 15 * 20, dtype=torch.float32)
+            current_ts = start_ts + t
+            x_raw, y_raw = -1, -1 # Default out-of-bounds
+            
+            if current_ts < episode_len:
+                for cam_name in self.camera_names:
+                    label_path = os.path.join(self.dataset_dir, 'yolo_labels', f'episode_{episode_id}', cam_name, f'{int(current_ts):05d}.txt')
+                    if os.path.exists(label_path):
+                        with open(label_path, 'r') as f:
+                            for line in f:
+                                parts = line.strip().split()
+                                if len(parts) >= 3 and parts[0] == '0':
+                                    # Convert normalized YOLO coordinates to raw pixel coordinates
+                                    x_raw = float(parts[1]) * 640.0
+                                    y_raw = float(parts[2]) * 480.0
+                                    break
+                        
+                        if x_raw != -1:
+                            break # Found class 0 box, stop looking in other cameras
+                            
+            current_reward = reward_seq[t] if (reward_seq is not None and t < action_len) else 0
+            
+            # Pass the extracted center point into the heatmap generator
+            hm = generate_gaze_heatmap([[x_raw, y_raw]], current_reward, self.camera_names, sigma=1.0)
             gaze_heatmaps.append(hm)
             
         # Shape is now natively (chunk_size, num_cameras * 300)
         gaze_data = torch.stack(gaze_heatmaps)
-        
-        ## single eye gaze
-        # if attention_seq is not None and action_len > 0:
-        #     # Only use index 0 for the attention and reward
-        #     hm = generate_gaze_heatmap(attention_seq[0], reward_seq[0], self.camera_names, sigma=1.0)
-        # else:
-        #     hm = torch.zeros(len(self.camera_names) * 15 * 20, dtype=torch.float32)
-            
-        # # Repeat the single heatmap `chunk_size` times to match the model's expected shape
-        # # This replaces the need for a loop and is much faster!
-        # # Shape becomes natively (chunk_size, num_cameras * 300)
-        # gaze_data = hm.unsqueeze(0).repeat(self.chunk_size, 1)
 
         # new axis for different cameras
         all_cam_images = []
@@ -177,21 +183,21 @@ class EpisodicDataset(torch.utils.data.Dataset):
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
         
-        # Load YOLO bounding box label (Kept untouched from your script)
+        # Load single-frame YOLO bounding box label (Kept from your original script for box_tensor)
         box_data = np.zeros(5, dtype=np.float32)
         for cam_name in self.camera_names:
             label_path = os.path.join(self.dataset_dir, 'yolo_labels', f'episode_{episode_id}', cam_name, f'{int(start_ts):05d}.txt')
             if os.path.exists(label_path):
                 with open(label_path, 'r') as f:
-                    line = f.readline().strip()
-                    if line:
-                        parts = line.split()
+                    for line in f:
+                        parts = line.strip().split()
                         if len(parts) >= 5 and parts[0] == '0':
                             box_data = np.array([float(x) for x in parts[:5]], dtype=np.float32)
                             break 
+                if np.any(box_data[1:]): 
+                    break
         box_tensor = torch.from_numpy(box_data).float()
 
-        # Added gaze_data to the final return tuple
         return image_data, qpos_data, action_data, is_pad, box_tensor, gaze_data
 
 def get_norm_stats(dataset_dir, num_episodes):
@@ -207,7 +213,6 @@ def get_norm_stats(dataset_dir, num_episodes):
         all_action_data.append(torch.from_numpy(action))
     all_qpos_data = torch.stack(all_qpos_data)
     all_action_data = torch.stack(all_action_data)
-    all_action_data = all_action_data
 
     # normalize action data
     action_mean = all_action_data.mean(dim=[0, 1], keepdim=True)

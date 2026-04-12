@@ -10,9 +10,9 @@ from einops import rearrange
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
-from utils_track import load_data # data functions
-from utils_track import sample_box_pose, sample_insertion_pose # robot functions
-from utils_track import compute_dict_mean, set_seed, detach_dict # helper functions
+from utils_sam import load_data # data functions
+from utils_sam import sample_box_pose, sample_insertion_pose # robot functions
+from utils_sam import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy_track import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
 
@@ -474,7 +474,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
     
     # NEW ARGUMENT FOR DEVICE
-    parser.add_argument('--device', action='store', type=str, default='cuda:0', help='Device to use (e.g. cuda:0, cuda:1, cpu)')
+    parser.add_argument('--device', action='store', type=str, default='cuda:1', help='Device to use (e.g. cuda:0, cuda:1, cpu)')
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
