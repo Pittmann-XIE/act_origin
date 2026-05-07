@@ -391,6 +391,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         qpos_list = []
         target_qpos_list = []
         rewards = []
+        pred_roi = np.zeros((480, 640, 3), dtype=np.uint8)
         with torch.inference_mode():
             for t in range(max_timesteps):
                 if onscreen_render:

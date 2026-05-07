@@ -64,7 +64,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
         all_cam_images = np.stack([image_dict[cam_name] for cam_name in self.camera_names], axis=0)
         target_rgb = image_dict[self.target_camera]
-        roi_weight_mask = (target_mask > 0).astype(np.float32)
+        roi_weight_mask =  (target_mask > 0).astype(np.float32) # full image: np.ones(target_rgb.shape[:2], dtype=np.float32)
         if roi_weight_mask.sum() == 0:
             raise ValueError(
                 f"Variant A expected non-empty ROI mask in {dataset_path} for camera {self.target_camera} at step {start_ts}."
