@@ -41,12 +41,14 @@ class ACTPolicy(nn.Module):
         self.lambda_roi = args_override.get("lambda_roi", 1.0)
         self.lambda_sem = args_override.get("lambda_sem", 0.1)
         self.lambda_sig = args_override.get("lambda_sig", 0.0)
+        self.lambda_recon_grad = args_override.get("lambda_recon_grad", 0.25)
         self.ema_momentum = args_override.get("ema_momentum", 0.99)
         self.comm_detach_warmup = args_override.get("comm_detach_warmup", 0)
         self._ema_updates = 0
         print(
             f"KL Weight {self.kl_weight}, lambda_roi {self.lambda_roi}, "
-            f"lambda_sem {self.lambda_sem}, lambda_sig {self.lambda_sig}"
+            f"lambda_sem {self.lambda_sem}, lambda_sig {self.lambda_sig}, "
+            f"lambda_recon_grad {self.lambda_recon_grad}"
         )
 
     def _should_detach_comm(self):
@@ -61,6 +63,21 @@ class ACTPolicy(nn.Module):
         std = torch.sqrt(z_comm_pool.var(dim=0, unbiased=False) + 1e-4)
         return F.relu(1.0 - std).mean()
 
+    @staticmethod
+    def _weighted_l1(pred, target, weight):
+        residual = F.l1_loss(pred, target, reduction="none")
+        return (residual * weight).sum() / weight.expand_as(residual).sum().clamp(min=1.0)
+
+    @classmethod
+    def _weighted_gradient_l1(cls, pred, target, weight):
+        pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+        target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+        weight_dx = torch.maximum(weight[:, :, :, 1:], weight[:, :, :, :-1])
+        pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+        target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+        weight_dy = torch.maximum(weight[:, :, 1:, :], weight[:, :, :-1, :])
+        return cls._weighted_l1(pred_dx, target_dx, weight_dx) + cls._weighted_l1(pred_dy, target_dy, weight_dy)
+
     def __call__(
         self,
         qpos,
@@ -69,6 +86,7 @@ class ACTPolicy(nn.Module):
         is_pad=None,
         target_rgb=None,
         roi_weight_mask=None,
+        return_comm=False,
     ):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -99,11 +117,15 @@ class ACTPolicy(nn.Module):
 
             if roi_hat is None or target_rgb is None or roi_weight_mask is None:
                 roi_loss = torch.zeros((), device=qpos.device)
+                recon_grad_loss = torch.zeros((), device=qpos.device)
             else:
+                if roi_hat.shape[-2:] != target_rgb.shape[-2:]:
+                    roi_hat = F.interpolate(roi_hat, size=target_rgb.shape[-2:], mode="bilinear", align_corners=False)
                 roi_weight = roi_weight_mask.unsqueeze(1)
-                roi_residual = F.l1_loss(roi_hat, target_rgb, reduction="none")
-                roi_loss = (roi_residual * roi_weight).sum() / roi_weight.expand_as(roi_residual).sum().clamp(min=1.0)
+                roi_loss = self._weighted_l1(roi_hat, target_rgb, roi_weight)
+                recon_grad_loss = self._weighted_gradient_l1(roi_hat, target_rgb, roi_weight)
             loss_dict["roi"] = roi_loss
+            loss_dict["recon_grad"] = recon_grad_loss
 
             if z_comm_pool is None or z_target_pool is None:
                 sem_loss = torch.zeros((), device=qpos.device)
@@ -117,14 +139,17 @@ class ACTPolicy(nn.Module):
                 loss_dict["l1"]
                 + loss_dict["kl"] * self.kl_weight
                 + loss_dict["roi"] * self.lambda_roi
+                + loss_dict["recon_grad"] * self.lambda_recon_grad
                 + loss_dict["sem"] * self.lambda_sem
                 + loss_dict["sig"] * self.lambda_sig
             )
             if roi_weight_mask is not None:
-                loss_dict["roi_fg"] = (roi_weight_mask > 0).float().mean()
+                loss_dict["roi_fg"] = (roi_weight_mask > roi_weight_mask.amin(dim=(-2, -1), keepdim=True)).float().mean()
             return loss_dict
 
         a_hat, _, (_, _), attn_weights, comm_outputs = self.model(qpos, image, env_state)
+        if return_comm:
+            return a_hat, attn_weights, comm_outputs
         return a_hat, attn_weights
 
     def update_ema(self):

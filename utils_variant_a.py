@@ -7,14 +7,35 @@ import torch
 from torch.utils.data import DataLoader
 
 
+def build_detail_weight_mask(rgb_image, background_weight=1.0, detail_weight=10.0):
+    gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    detail = np.sqrt(grad_x * grad_x + grad_y * grad_y)
+    if detail.max() > 0:
+        detail = detail / detail.max()
+    return (background_weight + detail_weight * detail).astype(np.float32)
+
+
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, target_camera):
+    def __init__(
+        self,
+        episode_ids,
+        dataset_dir,
+        camera_names,
+        norm_stats,
+        target_camera,
+        roi_background_weight=1.0,
+        roi_detail_weight=10.0,
+    ):
         super().__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
         self.norm_stats = norm_stats
         self.target_camera = target_camera
+        self.roi_background_weight = roi_background_weight
+        self.roi_detail_weight = roi_detail_weight
         self.is_sim = None
         self.__getitem__(0)
 
@@ -26,15 +47,6 @@ class EpisodicDataset(torch.utils.data.Dataset):
         episode_id = self.episode_ids[index]
         dataset_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
         with h5py.File(dataset_path, "r") as root:
-            if "/observations/masks" not in root:
-                raise ValueError(
-                    f"Variant A requires recorded masks, but {dataset_path} has no /observations/masks group."
-                )
-            if self.target_camera not in root["/observations/masks"]:
-                raise ValueError(
-                    f"Variant A requires masks for target camera {self.target_camera}, but they are missing in {dataset_path}."
-                )
-
             is_sim = root.attrs["sim"]
             original_action_shape = root["/action"].shape
             episode_len = original_action_shape[0]
@@ -47,7 +59,6 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 if img.shape[0] != 480 or img.shape[1] != 640:
                     img = cv2.resize(img, (640, 480), interpolation=cv2.INTER_AREA)
                 image_dict[cam_name] = img
-            target_mask = root[f"/observations/masks/{self.target_camera}"][start_ts]
 
             if is_sim:
                 action = root["/action"][start_ts:]
@@ -64,10 +75,15 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
         all_cam_images = np.stack([image_dict[cam_name] for cam_name in self.camera_names], axis=0)
         target_rgb = image_dict[self.target_camera]
-        roi_weight_mask =  (target_mask > 0).astype(np.float32) # full image: np.ones(target_rgb.shape[:2], dtype=np.float32)
+        roi_weight_mask = build_detail_weight_mask(
+            target_rgb,
+            background_weight=self.roi_background_weight,
+            detail_weight=self.roi_detail_weight,
+        )
         if roi_weight_mask.sum() == 0:
             raise ValueError(
-                f"Variant A expected non-empty ROI mask in {dataset_path} for camera {self.target_camera} at step {start_ts}."
+                f"Variant A expected a non-empty reconstruction weight mask in {dataset_path} "
+                f"for camera {self.target_camera} at step {start_ts}."
             )
 
         image_data = torch.from_numpy(all_cam_images)
@@ -131,7 +147,16 @@ def get_norm_stats(dataset_dir, num_episodes):
     }
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, target_camera):
+def load_data(
+    dataset_dir,
+    num_episodes,
+    camera_names,
+    batch_size_train,
+    batch_size_val,
+    target_camera,
+    roi_background_weight=1.0,
+    roi_detail_weight=10.0,
+):
     print(f"\nData from: {dataset_dir}\n")
     train_ratio = 0.8
     shuffled_indices = np.random.permutation(num_episodes)
@@ -139,8 +164,24 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     val_indices = shuffled_indices[int(train_ratio * num_episodes) :]
 
     norm_stats = get_norm_stats(dataset_dir, num_episodes)
-    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, target_camera)
-    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, target_camera)
+    train_dataset = EpisodicDataset(
+        train_indices,
+        dataset_dir,
+        camera_names,
+        norm_stats,
+        target_camera,
+        roi_background_weight=roi_background_weight,
+        roi_detail_weight=roi_detail_weight,
+    )
+    val_dataset = EpisodicDataset(
+        val_indices,
+        dataset_dir,
+        camera_names,
+        norm_stats,
+        target_camera,
+        roi_background_weight=roi_background_weight,
+        roi_detail_weight=roi_detail_weight,
+    )
 
     train_dataloader = DataLoader(
         train_dataset,

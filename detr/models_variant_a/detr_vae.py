@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.autograd import Variable
+from torch.nn import functional as F
 
 from ..models.backbone import build_backbone
 from ..models.transformer import build_transformer, TransformerEncoder, TransformerEncoderLayer
@@ -28,6 +29,13 @@ def get_sinusoid_encoding_table(n_position, d_hid):
     sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])
 
     return torch.FloatTensor(sinusoid_table).unsqueeze(0)
+
+
+def make_group_norm(channels):
+    for groups in (32, 16, 8, 4, 2, 1):
+        if channels % groups == 0:
+            return nn.GroupNorm(num_groups=groups, num_channels=channels)
+    return nn.GroupNorm(num_groups=1, num_channels=channels)
 
 
 class CommCrossAttentionLayer(nn.Module):
@@ -51,28 +59,79 @@ class CommCrossAttentionLayer(nn.Module):
         return query
 
 
+class ResidualConvBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            make_group_norm(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            make_group_norm(channels),
+        )
+        self.activation = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        return self.activation(x + self.block(x))
+
+
+class ResNetFeatureFusion(nn.Module):
+    def __init__(self, hidden_dim, layer_channels=(64, 128, 256, 512)):
+        super().__init__()
+        self.proj = nn.ModuleList([nn.Conv2d(channels, hidden_dim, kernel_size=1) for channels in layer_channels])
+        self.fuse = nn.Sequential(
+            nn.Conv2d(hidden_dim * len(layer_channels), hidden_dim, kernel_size=1),
+            make_group_norm(hidden_dim),
+            nn.SiLU(inplace=True),
+            ResidualConvBlock(hidden_dim),
+        )
+
+    def forward(self, features):
+        target_size = features[-1].shape[-2:]
+        fused_features = []
+        for feature, projection in zip(features, self.proj):
+            feature = projection(feature)
+            if feature.shape[-2:] != target_size:
+                feature = F.interpolate(feature, size=target_size, mode="bilinear", align_corners=False)
+            fused_features.append(feature)
+        return self.fuse(torch.cat(fused_features, dim=1))
+
+
 class CommDecoder(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
+        decoder_dims = [hidden_dim, 256, 192, 128, 96, 64]
         self.stem = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            make_group_norm(hidden_dim),
+            nn.SiLU(inplace=True),
+            ResidualConvBlock(hidden_dim),
+            ResidualConvBlock(hidden_dim),
         )
-        self.blocks = nn.ModuleList([
-            nn.Sequential(nn.Conv2d(hidden_dim, 128, kernel_size=3, padding=1), nn.ReLU(inplace=True)),
-            nn.Sequential(nn.Conv2d(128, 64, kernel_size=3, padding=1), nn.ReLU(inplace=True)),
-            nn.Sequential(nn.Conv2d(64, 32, kernel_size=3, padding=1), nn.ReLU(inplace=True)),
-            nn.Sequential(nn.Conv2d(32, 16, kernel_size=3, padding=1), nn.ReLU(inplace=True)),
-            nn.Sequential(nn.Conv2d(16, 8, kernel_size=3, padding=1), nn.ReLU(inplace=True)),
-        ])
-        self.head = nn.Conv2d(8, 3, kernel_size=1)
+        self.up_blocks = nn.ModuleList()
+        for in_dim, out_dim in zip(decoder_dims[:-1], decoder_dims[1:]):
+            self.up_blocks.append(
+                nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.Conv2d(in_dim, out_dim, kernel_size=3, padding=1),
+                    make_group_norm(out_dim),
+                    nn.SiLU(inplace=True),
+                    ResidualConvBlock(out_dim),
+                    ResidualConvBlock(out_dim),
+                )
+            )
+        self.refine = nn.Sequential(
+            ResidualConvBlock(decoder_dims[-1]),
+            nn.Conv2d(decoder_dims[-1], 32, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(32, 3, kernel_size=1),
+        )
 
     def forward(self, x):
         x = self.stem(x)
-        for block in self.blocks:
-            x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        for block in self.up_blocks:
             x = block(x)
-        return torch.sigmoid(self.head(x))
+        return torch.sigmoid(self.refine(x))
 
 
 class DETRVAE(nn.Module):
@@ -101,7 +160,7 @@ class DETRVAE(nn.Module):
         self.query_embed = nn.Embedding(num_queries, self.hidden_dim)
 
         if backbones is not None:
-            self.input_proj = nn.Conv2d(backbones[0].num_channels, self.hidden_dim, kernel_size=1)
+            self.visual_fusion = ResNetFeatureFusion(self.hidden_dim)
             self.backbones = nn.ModuleList(backbones)
             self.input_proj_robot_state = nn.Linear(state_dim, self.hidden_dim)
         else:
@@ -144,12 +203,12 @@ class DETRVAE(nn.Module):
         self.comm_decoder = CommDecoder(self.hidden_dim)
 
         self.ema_backbone = copy.deepcopy(self.backbones[self.target_camera_idx])
-        self.ema_input_proj = copy.deepcopy(self.input_proj)
+        self.ema_visual_fusion = copy.deepcopy(self.visual_fusion)
         self.ema_projector = copy.deepcopy(self.comm_pool_proj)
         self._freeze_ema()
 
     def _freeze_ema(self):
-        for module in [self.ema_backbone, self.ema_input_proj, self.ema_projector]:
+        for module in [self.ema_backbone, self.ema_visual_fusion, self.ema_projector]:
             for param in module.parameters():
                 param.requires_grad = False
 
@@ -157,10 +216,10 @@ class DETRVAE(nn.Module):
     def update_ema(self, momentum):
         online_modules = [
             self.backbones[self.target_camera_idx],
-            self.input_proj,
+            self.visual_fusion,
             self.comm_pool_proj,
         ]
-        ema_modules = [self.ema_backbone, self.ema_input_proj, self.ema_projector]
+        ema_modules = [self.ema_backbone, self.ema_visual_fusion, self.ema_projector]
         for online_module, ema_module in zip(online_modules, ema_modules):
             for ema_param, online_param in zip(ema_module.parameters(), online_module.parameters()):
                 ema_param.data.mul_(momentum).add_(online_param.data, alpha=1.0 - momentum)
@@ -189,8 +248,8 @@ class DETRVAE(nn.Module):
         feat_h = feat_w = None
         for cam_id, _ in enumerate(self.camera_names):
             features, pos = self.backbones[cam_id](image[:, cam_id])
-            features = self.input_proj(features[0])
-            pos = pos[0]
+            features = self.visual_fusion(features)
+            pos = pos[-1]
             feat_h, feat_w = features.shape[-2:]
             all_cam_features.append(features)
             all_cam_pos.append(pos)
@@ -256,7 +315,7 @@ class DETRVAE(nn.Module):
     @torch.no_grad()
     def _encode_ema_target(self, target_image):
         features, _ = self.ema_backbone(target_image)
-        target_tokens = self.ema_input_proj(features[0]).flatten(2).transpose(1, 2)
+        target_tokens = self.ema_visual_fusion(features).flatten(2).transpose(1, 2)
         return self.ema_projector(target_tokens.mean(dim=1))
 
     def forward(
@@ -367,8 +426,11 @@ def build_encoder(args):
 def build(args):
     state_dim = 14
     backbones = []
+    original_masks = getattr(args, "masks", False)
+    args.masks = True
     for _ in args.camera_names:
         backbones.append(build_backbone(args))
+    args.masks = original_masks
 
     transformer = build_transformer(args)
     encoder = build_encoder(args)

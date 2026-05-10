@@ -13,7 +13,6 @@ from tqdm import tqdm
 
 from constants import DT, PUPPET_GRIPPER_JOINT_OPEN
 from policy_variant_a import ACTPolicy, CNNMLPPolicy
-from record_sim_episodes import get_target_geom_classes, render_target_mask
 from utils_variant_a import (
     compute_dict_mean,
     load_data,
@@ -84,6 +83,7 @@ def main(args):
             "lambda_roi": args["lambda_roi"],
             "lambda_sem": args["lambda_sem"],
             "lambda_sig": args["lambda_sig"],
+            "lambda_recon_grad": args["lambda_recon_grad"],
             "comm_num_queries": args["comm_num_queries"],
             "comm_layers": args["comm_layers"],
             "comm_detach_warmup": args["comm_detach_warmup"],
@@ -134,6 +134,8 @@ def main(args):
         batch_size_train,
         batch_size_val,
         target_camera,
+        roi_background_weight=args["roi_background_weight"],
+        roi_detail_weight=args["roi_detail_weight"],
     )
 
     if not os.path.isdir(ckpt_dir):
@@ -260,11 +262,6 @@ def tensor_to_uint8_image(image_tensor):
     return (image * 255.0).astype(np.uint8)
 
 
-def make_masked_roi(rgb_image, roi_mask):
-    masked = rgb_image.astype(np.float32) * roi_mask[..., None].astype(np.float32)
-    return np.clip(masked, 0.0, 255.0).astype(np.uint8)
-
-
 def add_panel_label(image, text):
     labeled = image.copy()
     cv2.putText(
@@ -357,7 +354,6 @@ def eval_bc(config, ckpt_name, save_episode=True):
     env_max_reward = env.task.max_reward
     if "sim_transfer_cube" not in task_name:
         raise NotImplementedError("Variant A eval ROI visualization currently supports sim_transfer_cube only.")
-    target_geom_classes = get_target_geom_classes(env.physics)
 
     query_frequency = policy_config["num_queries"]
     if temporal_agg:
@@ -404,15 +400,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 qpos = torch.from_numpy(pre_process(qpos_numpy)).float().to(device_obj).unsqueeze(0)
                 curr_image = get_image(ts, camera_names, device_obj)
                 obs_target_rgb = obs["images"][target_camera]
-                roi_mask = render_target_mask(env.physics, target_camera, target_geom_classes) > 0
-                gt_roi = make_masked_roi(obs_target_rgb, roi_mask)
+                gt_roi = obs_target_rgb
 
                 if config["policy_class"] == "ACT":
                     if t % query_frequency == 0:
                         all_actions, _, comm_outputs = policy(qpos, curr_image, return_comm=True)
                         roi_hat = comm_outputs.get("roi_hat")
-                        pred_roi_full = tensor_to_uint8_image(roi_hat) if roi_hat is not None else np.zeros_like(gt_roi)
-                        pred_roi = make_masked_roi(pred_roi_full, roi_mask)
+                        pred_roi = tensor_to_uint8_image(roi_hat) if roi_hat is not None else np.zeros_like(gt_roi)
                     if temporal_agg:
                         all_time_actions[[t], t : t + num_queries] = all_actions
                         actions_for_curr_step = all_time_actions[:, t]
@@ -621,8 +615,11 @@ if __name__ == "__main__":
     parser.add_argument("--temporal_agg", action="store_true")
     parser.add_argument("--target_camera", action="store", type=str, default=None)
     parser.add_argument("--lambda_roi", action="store", type=float, default=1.0)
+    parser.add_argument("--lambda_recon_grad", action="store", type=float, default=0.25)
     parser.add_argument("--lambda_sem", action="store", type=float, default=0.1)
     parser.add_argument("--lambda_sig", action="store", type=float, default=0.0)
+    parser.add_argument("--roi_background_weight", action="store", type=float, default=1.0)
+    parser.add_argument("--roi_detail_weight", action="store", type=float, default=10.0)
     parser.add_argument("--comm_num_queries", action="store", type=int, default=8)
     parser.add_argument("--comm_layers", action="store", type=int, default=2)
     parser.add_argument("--comm_detach_warmup", action="store", type=int, default=0)
