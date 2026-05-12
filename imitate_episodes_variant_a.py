@@ -8,6 +8,7 @@ from copy import deepcopy
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 from einops import rearrange
 from tqdm import tqdm
 
@@ -84,6 +85,7 @@ def main(args):
             "lambda_sem": args["lambda_sem"],
             "lambda_sig": args["lambda_sig"],
             "lambda_recon_grad": args["lambda_recon_grad"],
+            "focus_masked_region": args["focus_masked_region"],
             "comm_num_queries": args["comm_num_queries"],
             "comm_layers": args["comm_layers"],
             "comm_detach_warmup": args["comm_detach_warmup"],
@@ -116,7 +118,12 @@ def main(args):
         "real_robot": not is_sim,
         "device": device,
         "resume_ckpt": args.get("resume_ckpt"),
+        "grad_accum_steps": args.get("grad_accum_steps", 1),
     }
+
+    if args.get("export_netron_onnx"):
+        export_act_netron_onnx(config, args["export_netron_onnx"], args.get("export_ckpt"))
+        return
 
     if is_eval:
         results = []
@@ -136,6 +143,7 @@ def main(args):
         target_camera,
         roi_background_weight=args["roi_background_weight"],
         roi_detail_weight=args["roi_detail_weight"],
+        focus_masked_region=args["focus_masked_region"],
     )
 
     if not os.path.isdir(ckpt_dir):
@@ -167,6 +175,62 @@ def checkpoint_model_state(checkpoint):
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         return checkpoint["model_state_dict"]
     return checkpoint
+
+
+class ACTNetronExportWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1))
+        self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1))
+
+    def forward(self, qpos, image):
+        image = (image - self.image_mean) / self.image_std
+        a_hat, is_pad_hat, _, _, comm_outputs = self.model(qpos, image, None)
+        return a_hat, is_pad_hat, comm_outputs["roi_hat"], comm_outputs["z_comm_pool"]
+
+
+def export_act_netron_onnx(config, output_path, ckpt_path=None):
+    if config["policy_class"] != "ACT":
+        raise NotImplementedError("Netron ONNX export is implemented for ACT policy only.")
+
+    device = torch.device(config.get("device", "cuda") if torch.cuda.is_available() else "cpu")
+    policy = make_policy(config["policy_class"], config["policy_config"])
+    if ckpt_path:
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        loading_status = policy.load_state_dict(checkpoint_model_state(checkpoint))
+        print(f"Loaded export checkpoint from {ckpt_path}: {loading_status}")
+
+    policy.to(device)
+    policy.eval()
+    wrapper = ACTNetronExportWrapper(policy.model).to(device).eval()
+
+    batch_size = 1
+    num_cameras = len(config["camera_names"])
+    state_dim = config["state_dim"]
+    dummy_qpos = torch.zeros(batch_size, state_dim, dtype=torch.float32, device=device)
+    dummy_image = torch.zeros(batch_size, num_cameras, 3, 480, 640, dtype=torch.float32, device=device)
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            (dummy_qpos, dummy_image),
+            output_path,
+            input_names=["qpos", "image"],
+            output_names=["actions", "is_pad", "roi_hat", "z_comm_pool"],
+            dynamic_axes={
+                "qpos": {0: "batch"},
+                "image": {0: "batch"},
+                "actions": {0: "batch"},
+                "is_pad": {0: "batch"},
+                "roi_hat": {0: "batch"},
+                "z_comm_pool": {0: "batch"},
+            },
+            opset_version=17,
+            do_constant_folding=True,
+        )
+    print(f"Saved Netron ONNX graph to {output_path}")
 
 
 def scalarize_dict(metrics):
@@ -465,14 +529,15 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 
 def forward_pass(data, policy, device="cuda"):
-    image_data, qpos_data, action_data, is_pad, _, target_rgb, roi_weight_mask = data
+    image_data, qpos_data, action_data, is_pad, _, target_rgb, roi_weight_mask, focus_weight_mask = data
     image_data = image_data.to(device)
     qpos_data = qpos_data.to(device)
     action_data = action_data.to(device)
     is_pad = is_pad.to(device)
     target_rgb = target_rgb.to(device)
     roi_weight_mask = roi_weight_mask.to(device)
-    return policy(qpos_data, image_data, action_data, is_pad, target_rgb, roi_weight_mask)
+    focus_weight_mask = focus_weight_mask.to(device)
+    return policy(qpos_data, image_data, action_data, is_pad, target_rgb, roi_weight_mask, focus_weight_mask)
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -483,12 +548,15 @@ def train_bc(train_dataloader, val_dataloader, config):
     policy_config = config["policy_config"]
     device = config["device"]
     resume_ckpt = config.get("resume_ckpt")
+    grad_accum_steps = max(1, int(config.get("grad_accum_steps", 1)))
 
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
     policy.to(device)
     optimizer = make_optimizer(policy_class, policy)
+    if grad_accum_steps > 1:
+        print(f"Using gradient accumulation: {grad_accum_steps} steps")
 
     train_history = []
     validation_history = []
@@ -528,16 +596,18 @@ def train_bc(train_dataloader, val_dataloader, config):
         print("".join([f"{key}: {value:.3f} " for key, value in epoch_summary.items()]))
 
         policy.train()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         epoch_start_idx = len(train_history)
         for batch_idx, data in enumerate(train_dataloader):
             forward_dict = forward_pass(data, policy, device)
             loss = forward_dict["loss"]
-            loss.backward()
-            optimizer.step()
-            if hasattr(policy, "update_ema"):
-                policy.update_ema()
-            optimizer.zero_grad()
+            (loss / grad_accum_steps).backward()
+            should_step = (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(train_dataloader)
+            if should_step:
+                optimizer.step()
+                if hasattr(policy, "update_ema"):
+                    policy.update_ema()
+                optimizer.zero_grad(set_to_none=True)
             train_history.append(scalarize_dict(forward_dict))
         epoch_summary = compute_dict_mean(train_history[epoch_start_idx:])
         epoch_train_loss = epoch_summary["loss"]
@@ -620,9 +690,13 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_sig", action="store", type=float, default=0.0)
     parser.add_argument("--roi_background_weight", action="store", type=float, default=1.0)
     parser.add_argument("--roi_detail_weight", action="store", type=float, default=10.0)
+    parser.add_argument("--focus_masked_region", action="store_true")
     parser.add_argument("--comm_num_queries", action="store", type=int, default=8)
     parser.add_argument("--comm_layers", action="store", type=int, default=2)
     parser.add_argument("--comm_detach_warmup", action="store", type=int, default=0)
     parser.add_argument("--ema_momentum", action="store", type=float, default=0.99)
     parser.add_argument("--resume_ckpt", action="store", type=str, default=None)
+    parser.add_argument("--grad_accum_steps", action="store", type=int, default=1)
+    parser.add_argument("--export_netron_onnx", action="store", type=str, default=None)
+    parser.add_argument("--export_ckpt", action="store", type=str, default=None)
     main(vars(parser.parse_args()))

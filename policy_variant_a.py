@@ -42,13 +42,16 @@ class ACTPolicy(nn.Module):
         self.lambda_sem = args_override.get("lambda_sem", 0.1)
         self.lambda_sig = args_override.get("lambda_sig", 0.0)
         self.lambda_recon_grad = args_override.get("lambda_recon_grad", 0.25)
+        self.focus_masked_region = args_override.get("focus_masked_region", False)
+        self.lambda_masked_region = 1.0
         self.ema_momentum = args_override.get("ema_momentum", 0.99)
         self.comm_detach_warmup = args_override.get("comm_detach_warmup", 0)
         self._ema_updates = 0
         print(
             f"KL Weight {self.kl_weight}, lambda_roi {self.lambda_roi}, "
             f"lambda_sem {self.lambda_sem}, lambda_sig {self.lambda_sig}, "
-            f"lambda_recon_grad {self.lambda_recon_grad}"
+            f"lambda_recon_grad {self.lambda_recon_grad}, "
+            f"focus_masked_region {self.focus_masked_region}"
         )
 
     def _should_detach_comm(self):
@@ -86,6 +89,7 @@ class ACTPolicy(nn.Module):
         is_pad=None,
         target_rgb=None,
         roi_weight_mask=None,
+        focus_weight_mask=None,
         return_comm=False,
     ):
         env_state = None
@@ -118,14 +122,24 @@ class ACTPolicy(nn.Module):
             if roi_hat is None or target_rgb is None or roi_weight_mask is None:
                 roi_loss = torch.zeros((), device=qpos.device)
                 recon_grad_loss = torch.zeros((), device=qpos.device)
+                masked_region_loss = torch.zeros((), device=qpos.device)
             else:
                 if roi_hat.shape[-2:] != target_rgb.shape[-2:]:
                     roi_hat = F.interpolate(roi_hat, size=target_rgb.shape[-2:], mode="bilinear", align_corners=False)
                 roi_weight = roi_weight_mask.unsqueeze(1)
                 roi_loss = self._weighted_l1(roi_hat, target_rgb, roi_weight)
                 recon_grad_loss = self._weighted_gradient_l1(roi_hat, target_rgb, roi_weight)
+                if (
+                    self.focus_masked_region
+                    and focus_weight_mask is not None
+                    and focus_weight_mask.sum().item() > 0
+                ):
+                    masked_region_loss = self._weighted_l1(roi_hat, target_rgb, focus_weight_mask.unsqueeze(1))
+                else:
+                    masked_region_loss = torch.zeros((), device=qpos.device)
             loss_dict["roi"] = roi_loss
             loss_dict["recon_grad"] = recon_grad_loss
+            loss_dict["roi_focus"] = masked_region_loss
 
             if z_comm_pool is None or z_target_pool is None:
                 sem_loss = torch.zeros((), device=qpos.device)
@@ -140,11 +154,14 @@ class ACTPolicy(nn.Module):
                 + loss_dict["kl"] * self.kl_weight
                 + loss_dict["roi"] * self.lambda_roi
                 + loss_dict["recon_grad"] * self.lambda_recon_grad
+                + loss_dict["roi_focus"] * self.lambda_masked_region
                 + loss_dict["sem"] * self.lambda_sem
                 + loss_dict["sig"] * self.lambda_sig
             )
             if roi_weight_mask is not None:
                 loss_dict["roi_fg"] = (roi_weight_mask > roi_weight_mask.amin(dim=(-2, -1), keepdim=True)).float().mean()
+            if focus_weight_mask is not None:
+                loss_dict["focus_fg"] = (focus_weight_mask > 0).float().mean()
             return loss_dict
 
         a_hat, _, (_, _), attn_weights, comm_outputs = self.model(qpos, image, env_state)

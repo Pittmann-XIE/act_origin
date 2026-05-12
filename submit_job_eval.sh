@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=BiA200
+#SBATCH --job-name=VariantA_Eval          # Job name
 #SBATCH --output=slurm_eval_%j.out    # Standard output log (%j inserts job ID)
 #SBATCH --error=slurm_eval_%j.err     # Standard error log
 #SBATCH --nodes=1                      # Run everything on one machine
@@ -23,9 +23,9 @@ export PYOPENGL_PLATFORM=egl
 # --------------------------------------------------
 
 # Run the evaluation script
-python -u imitate_episodes_bisim_A.py \
+python -u imitate_episodes_variant_a.py \
     --task_name sim_transfer_cube_scripted \
-    --ckpt_dir /home/fe/xie/act_origin/checkpoints/checkpoints_sim_transfer_cube_bisim_A_200\
+    --ckpt_dir /home/fe/xie/act_origin/checkpoints/checkpoints_variant_a_sim_transfer_cube_scripted_top_fpn_dcae \
     --policy_class ACT \
     --kl_weight 10 \
     --chunk_size 100 \

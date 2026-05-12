@@ -17,6 +17,13 @@ def build_detail_weight_mask(rgb_image, background_weight=1.0, detail_weight=10.
     return (background_weight + detail_weight * detail).astype(np.float32)
 
 
+def build_focus_region_weight_mask(mask_image, cube_weight=3.0, gripper_weight=1.5):
+    focus_weight_mask = np.zeros_like(mask_image, dtype=np.float32)
+    focus_weight_mask[mask_image == 1] = cube_weight
+    focus_weight_mask[(mask_image == 2) | (mask_image == 3)] = gripper_weight
+    return focus_weight_mask
+
+
 class EpisodicDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -27,6 +34,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         target_camera,
         roi_background_weight=1.0,
         roi_detail_weight=10.0,
+        focus_masked_region=False,
     ):
         super().__init__()
         self.episode_ids = episode_ids
@@ -36,6 +44,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.target_camera = target_camera
         self.roi_background_weight = roi_background_weight
         self.roi_detail_weight = roi_detail_weight
+        self.focus_masked_region = focus_masked_region
         self.is_sim = None
         self.__getitem__(0)
 
@@ -59,6 +68,17 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 if img.shape[0] != 480 or img.shape[1] != 640:
                     img = cv2.resize(img, (640, 480), interpolation=cv2.INTER_AREA)
                 image_dict[cam_name] = img
+            target_mask = None
+            if self.focus_masked_region:
+                mask_path = f"/observations/masks/{self.target_camera}"
+                if mask_path not in root:
+                    raise KeyError(
+                        f"Variant A expected semantic masks at {mask_path} in {dataset_path} "
+                        "when focus_masked_region is enabled."
+                    )
+                target_mask = root[mask_path][start_ts]
+                if target_mask.shape[0] != 480 or target_mask.shape[1] != 640:
+                    target_mask = cv2.resize(target_mask, (640, 480), interpolation=cv2.INTER_NEAREST)
 
             if is_sim:
                 action = root["/action"][start_ts:]
@@ -80,6 +100,11 @@ class EpisodicDataset(torch.utils.data.Dataset):
             background_weight=self.roi_background_weight,
             detail_weight=self.roi_detail_weight,
         )
+        focus_weight_mask = (
+            build_focus_region_weight_mask(target_mask)
+            if target_mask is not None
+            else np.zeros(target_rgb.shape[:2], dtype=np.float32)
+        )
         if roi_weight_mask.sum() == 0:
             raise ValueError(
                 f"Variant A expected a non-empty reconstruction weight mask in {dataset_path} "
@@ -94,6 +119,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         image_data = torch.einsum("k h w c -> k c h w", image_data).float() / 255.0
         target_rgb = torch.from_numpy(target_rgb).permute(2, 0, 1).float() / 255.0
         roi_weight_mask = torch.from_numpy(roi_weight_mask).float()
+        focus_weight_mask = torch.from_numpy(focus_weight_mask).float()
 
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
@@ -117,7 +143,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
                             break
         box_tensor = torch.from_numpy(box_data).float()
 
-        return image_data, qpos_data, action_data, is_pad_tensor, box_tensor, target_rgb, roi_weight_mask
+        return image_data, qpos_data, action_data, is_pad_tensor, box_tensor, target_rgb, roi_weight_mask, focus_weight_mask
 
 
 def get_norm_stats(dataset_dir, num_episodes):
@@ -156,6 +182,7 @@ def load_data(
     target_camera,
     roi_background_weight=1.0,
     roi_detail_weight=10.0,
+    focus_masked_region=False,
 ):
     print(f"\nData from: {dataset_dir}\n")
     train_ratio = 0.8
@@ -172,6 +199,7 @@ def load_data(
         target_camera,
         roi_background_weight=roi_background_weight,
         roi_detail_weight=roi_detail_weight,
+        focus_masked_region=focus_masked_region,
     )
     val_dataset = EpisodicDataset(
         val_indices,
@@ -181,6 +209,7 @@ def load_data(
         target_camera,
         roi_background_weight=roi_background_weight,
         roi_detail_weight=roi_detail_weight,
+        focus_masked_region=focus_masked_region,
     )
 
     train_dataloader = DataLoader(
