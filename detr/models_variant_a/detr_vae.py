@@ -327,8 +327,11 @@ class DETRVAE(nn.Module):
         is_pad=None,
         target_image=None,
         detach_comm=False,
+        force_zero_latent=False,
+        run_comm=True,
+        encode_target_semantics=True,
     ):
-        is_training = actions is not None
+        is_training = actions is not None and not force_zero_latent
         bs, _ = qpos.shape
 
         if is_training:
@@ -357,11 +360,11 @@ class DETRVAE(nn.Module):
             "z_comm_pool": None,
             "z_target_pool": None,
         }
-        if memory is not None and feat_h is not None and feat_w is not None:
+        if run_comm and memory is not None and feat_h is not None and feat_w is not None:
             roi_hat, z_comm_pool = self._run_comm_branch(memory, feat_h, feat_w, detach_comm=detach_comm)
             comm_outputs["roi_hat"] = roi_hat
             comm_outputs["z_comm_pool"] = z_comm_pool
-            if target_image is not None:
+            if encode_target_semantics and target_image is not None:
                 comm_outputs["z_target_pool"] = self._encode_ema_target(target_image)
 
         return a_hat, is_pad_hat, [mu, logvar], attn_weights, comm_outputs

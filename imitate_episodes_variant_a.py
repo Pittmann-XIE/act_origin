@@ -23,6 +23,24 @@ from utils_variant_a import (
 )
 from visualize_episodes import save_videos
 
+"""
+Multi-stage training notes (Variant A):
+
+- Purpose: `two_stage` is a two-phase training workflow for the ACT policy
+    that controls which parts of the model are trained and in what order.
+    It helps separate learning of the action head from learning the ROI/comm
+    branch.
+
+- `two_stage`: stage order `act` -> `roi`.
+    * Stage 1 (`act`): train action prediction components.
+    * Stage 2 (`roi`): train ROI / communication components while keeping
+        action parameters fixed.
+
+- Note: Variant A does not implement `three_stage` (future prediction
+    branch is not present in Variant A). For three-stage training and the
+    action-conditioned future simulator, see Variant B.
+"""
+
 
 def main(args):
     set_seed(1)
@@ -119,6 +137,9 @@ def main(args):
         "device": device,
         "resume_ckpt": args.get("resume_ckpt"),
         "grad_accum_steps": args.get("grad_accum_steps", 1),
+        "two_stage": args.get("two_stage", False),
+        "stage1_epochs": args.get("stage1_epochs"),
+        "stage2_epochs": args.get("stage2_epochs"),
     }
 
     if args.get("export_netron_onnx"):
@@ -133,6 +154,16 @@ def main(args):
         for ckpt_name, success_rate, avg_return in results:
             print(f"{ckpt_name}: {success_rate=} {avg_return=}")
         return
+
+    if config["two_stage"]:
+        if policy_class != "ACT":
+            raise NotImplementedError("--two_stage is implemented for ACT policy only.")
+        if args.get("resume_ckpt") is not None:
+            raise ValueError("--resume_ckpt is not supported with --two_stage in this version.")
+        if args.get("stage1_epochs") is None or args.get("stage2_epochs") is None:
+            raise ValueError("--two_stage requires both --stage1_epochs and --stage2_epochs.")
+    elif num_epochs is None:
+        raise ValueError("--num_epochs is required unless --two_stage is enabled.")
 
     train_dataloader, val_dataloader, stats, _ = load_data(
         dataset_dir,
@@ -151,10 +182,13 @@ def main(args):
     with open(os.path.join(ckpt_dir, "dataset_stats.pkl"), "wb") as file_obj:
         pickle.dump(stats, file_obj)
 
-    best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
-    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    torch.save(best_state_dict, os.path.join(ckpt_dir, "policy_best.ckpt"))
-    print(f"Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}")
+    if config["two_stage"]:
+        best_ckpt_info = train_bc_two_stage(train_dataloader, val_dataloader, config)
+    else:
+        best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
+        best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+        torch.save(best_state_dict, os.path.join(ckpt_dir, "policy_best.ckpt"))
+        print(f"Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}")
 
 
 def make_policy(policy_class, policy_config):
@@ -252,6 +286,7 @@ def save_training_checkpoint(
     validation_history,
     min_val_loss,
     best_ckpt_info,
+    config=None,
 ):
     best_epoch = None
     best_state_dict = None
@@ -268,6 +303,7 @@ def save_training_checkpoint(
             "min_val_loss": min_val_loss,
             "best_epoch": best_epoch,
             "best_state_dict": best_state_dict,
+            "config": config,
         },
         ckpt_path,
     )
@@ -579,6 +615,22 @@ def train_bc(train_dataloader, val_dataloader, config):
             best_ckpt_info = (start_epoch - 1, min_val_loss, deepcopy(policy.state_dict()))
         return best_ckpt_info
 
+    # Save initial checkpoint with config and current optimizer/policy state
+    try:
+        save_training_checkpoint(
+            os.path.join(ckpt_dir, f"policy_initial_seed_{seed}_training.ckpt"),
+            start_epoch,
+            policy,
+            optimizer,
+            train_history,
+            validation_history,
+            min_val_loss,
+            best_ckpt_info,
+            config,
+        )
+    except Exception as exc:
+        print(f"Warning: failed to write initial training checkpoint: {exc}")
+
     for epoch in tqdm(range(start_epoch, num_epochs)):
         print(f"\nEpoch {epoch}")
         with torch.inference_mode():
@@ -625,6 +677,7 @@ def train_bc(train_dataloader, val_dataloader, config):
                 validation_history,
                 min_val_loss,
                 best_ckpt_info,
+                config,
             )
             plot_history(train_history, validation_history, epoch + 1, ckpt_dir, seed)
 
@@ -638,6 +691,7 @@ def train_bc(train_dataloader, val_dataloader, config):
         validation_history,
         min_val_loss,
         best_ckpt_info,
+        config,
     )
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
     torch.save(best_state_dict, os.path.join(ckpt_dir, f"policy_epoch_{best_epoch}_seed_{seed}.ckpt"))
@@ -646,11 +700,166 @@ def train_bc(train_dataloader, val_dataloader, config):
     return best_ckpt_info
 
 
-def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
+def train_stage(
+    policy,
+    train_dataloader,
+    val_dataloader,
+    config,
+    stage,
+    num_epochs,
+    ckpt_prefix,
+):
+    ckpt_dir = config["ckpt_dir"]
+    seed = config["seed"]
+    device = config["device"]
+    grad_accum_steps = max(1, int(config.get("grad_accum_steps", 1)))
+
+    policy.set_train_stage(stage)
+    optimizer = policy.configure_optimizers()
+
+    train_history = []
+    validation_history = []
+    min_val_loss = np.inf
+    best_ckpt_info = None
+
+    if grad_accum_steps > 1:
+        print(f"Using gradient accumulation for {ckpt_prefix}: {grad_accum_steps} steps")
+
+    # Save initial checkpoint for this stage including config
+    try:
+        save_training_checkpoint(
+            os.path.join(ckpt_dir, f"policy_{ckpt_prefix}_initial_seed_{seed}_training.ckpt"),
+            0,
+            policy,
+            optimizer,
+            train_history,
+            validation_history,
+            min_val_loss,
+            best_ckpt_info,
+            config,
+        )
+    except Exception as exc:
+        print(f"Warning: failed to write initial stage checkpoint: {exc}")
+
+    for epoch in tqdm(range(num_epochs)):
+        print(f"\n{ckpt_prefix} Epoch {epoch}")
+        with torch.inference_mode():
+            policy.eval()
+            epoch_dicts = []
+            for data in val_dataloader:
+                epoch_dicts.append(scalarize_dict(forward_pass(data, policy, device)))
+            epoch_summary = compute_dict_mean(epoch_dicts)
+            validation_history.append(epoch_summary)
+            epoch_val_loss = epoch_summary["loss"]
+            if epoch_val_loss < min_val_loss:
+                min_val_loss = epoch_val_loss
+                best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
+        print(f"Val loss:   {epoch_val_loss:.5f}")
+        print("".join([f"{key}: {value:.3f} " for key, value in epoch_summary.items()]))
+
+        policy.train()
+        optimizer.zero_grad(set_to_none=True)
+        epoch_start_idx = len(train_history)
+        for batch_idx, data in enumerate(train_dataloader):
+            forward_dict = forward_pass(data, policy, device)
+            loss = forward_dict["loss"]
+            (loss / grad_accum_steps).backward()
+            should_step = (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(train_dataloader)
+            if should_step:
+                optimizer.step()
+                if hasattr(policy, "update_ema"):
+                    policy.update_ema()
+                optimizer.zero_grad(set_to_none=True)
+            train_history.append(scalarize_dict(forward_dict))
+        epoch_summary = compute_dict_mean(train_history[epoch_start_idx:])
+        epoch_train_loss = epoch_summary["loss"]
+        print(f"Train loss: {epoch_train_loss:.5f}")
+        print("".join([f"{key}: {value:.3f} " for key, value in epoch_summary.items()]))
+
+        if epoch % 100 == 0:
+            torch.save(policy.state_dict(), os.path.join(ckpt_dir, f"policy_{ckpt_prefix}_epoch_{epoch}_seed_{seed}.ckpt"))
+            save_training_checkpoint(
+                os.path.join(ckpt_dir, f"policy_{ckpt_prefix}_epoch_{epoch}_seed_{seed}_training.ckpt"),
+                epoch,
+                policy,
+                optimizer,
+                train_history,
+                validation_history,
+                min_val_loss,
+                best_ckpt_info,
+                config,
+            )
+            plot_history(train_history, validation_history, epoch + 1, ckpt_dir, seed, prefix=f"{ckpt_prefix}_")
+
+    torch.save(policy.state_dict(), os.path.join(ckpt_dir, f"policy_{ckpt_prefix}_last.ckpt"))
+    save_training_checkpoint(
+        os.path.join(ckpt_dir, f"policy_{ckpt_prefix}_last_training.ckpt"),
+        num_epochs - 1,
+        policy,
+        optimizer,
+        train_history,
+        validation_history,
+        min_val_loss,
+        best_ckpt_info,
+        config,
+    )
+    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+    torch.save(best_state_dict, os.path.join(ckpt_dir, f"policy_{ckpt_prefix}_best.ckpt"))
+    print(f"{ckpt_prefix} finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}")
+    plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed, prefix=f"{ckpt_prefix}_")
+    return best_ckpt_info
+
+
+def train_bc_two_stage(train_dataloader, val_dataloader, config):
+    seed = config["seed"]
+    device = config["device"]
+    ckpt_dir = config["ckpt_dir"]
+    stage1_epochs = int(config["stage1_epochs"])
+    stage2_epochs = int(config["stage2_epochs"])
+
+    if stage1_epochs <= 0 or stage2_epochs <= 0:
+        raise ValueError("--stage1_epochs and --stage2_epochs must both be positive.")
+
+    set_seed(seed)
+    policy = make_policy(config["policy_class"], config["policy_config"])
+    policy.to(device)
+
+    print(f"\nStarting two-stage training: stage1_epochs={stage1_epochs}, stage2_epochs={stage2_epochs}")
+    stage1_best_info = train_stage(
+        policy,
+        train_dataloader,
+        val_dataloader,
+        config,
+        stage="act",
+        num_epochs=stage1_epochs,
+        ckpt_prefix="stage1",
+    )
+
+    _, _, stage1_best_state_dict = stage1_best_info
+    loading_status = policy.load_state_dict(stage1_best_state_dict)
+    print(f"Loaded stage 1 best checkpoint for stage 2: {loading_status}")
+
+    stage2_best_info = train_stage(
+        policy,
+        train_dataloader,
+        val_dataloader,
+        config,
+        stage="roi",
+        num_epochs=stage2_epochs,
+        ckpt_prefix="stage2",
+    )
+
+    best_epoch, min_val_loss, best_state_dict = stage2_best_info
+    torch.save(best_state_dict, os.path.join(ckpt_dir, "policy_best.ckpt"))
+    print(f"Best two-stage ckpt, stage 2 val loss {min_val_loss:.6f} @ epoch{best_epoch}")
+    return stage2_best_info
+
+
+def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed, prefix=""):
     if not train_history or not validation_history:
         return
     for key in train_history[0]:
-        plot_path = os.path.join(ckpt_dir, f"train_val_{key}_seed_{seed}.png")
+        plot_path = os.path.join(ckpt_dir, f"{prefix}train_val_{key}_seed_{seed}.png")
         plt.figure()
         train_values = [summary[key] for summary in train_history]
         val_values = [summary[key] for summary in validation_history]
@@ -675,7 +884,10 @@ if __name__ == "__main__":
     parser.add_argument("--num_episodes", action="store", type=int, default=None)
     parser.add_argument("--batch_size", action="store", type=int, required=True)
     parser.add_argument("--seed", action="store", type=int, required=True)
-    parser.add_argument("--num_epochs", action="store", type=int, required=True)
+    parser.add_argument("--num_epochs", action="store", type=int, default=None)
+    parser.add_argument("--two_stage", action="store_true")
+    parser.add_argument("--stage1_epochs", action="store", type=int, default=None)
+    parser.add_argument("--stage2_epochs", action="store", type=int, default=None)
     parser.add_argument("--lr", action="store", type=float, required=True)
     parser.add_argument("--device", action="store", type=str, default="cuda")
     parser.add_argument("--kl_weight", action="store", type=float, required=False, default=10.0)
