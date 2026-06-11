@@ -1066,6 +1066,9 @@ def train_bc_two_stage(train_dataloader, val_dataloader, config):
     else:
         print("Resume checkpoint is already in stage 2; skipping stage 1.")
 
+    stage2_start_epoch = resume_start_epoch if resume_stage_idx == 1 else 0
+    if stage2_start_epoch == 0:
+        init_codebook_kmeans(policy, train_dataloader, device)
     stage2_best_info = train_stage(
         policy,
         train_dataloader,
@@ -1074,7 +1077,7 @@ def train_bc_two_stage(train_dataloader, val_dataloader, config):
         stage="roi",
         num_epochs=stage2_epochs,
         ckpt_prefix="stage2",
-        start_epoch=resume_start_epoch if resume_stage_idx == 1 else 0,
+        start_epoch=stage2_start_epoch,
         resume_checkpoint=resume_checkpoint if resume_stage_idx == 1 else None,
     )
 
@@ -1140,6 +1143,9 @@ def train_bc_three_stage(train_dataloader, val_dataloader, config):
         print("Resume checkpoint is already past stage 1; skipping stage 1.")
 
     if resume_stage_idx <= 1:
+        stage2_start_epoch = resume_start_epoch if resume_stage_idx == 1 else 0
+        if stage2_start_epoch == 0:
+            init_codebook_kmeans(policy, train_dataloader, device)
         stage2_best_info = train_stage(
             policy,
             train_dataloader,
@@ -1148,7 +1154,7 @@ def train_bc_three_stage(train_dataloader, val_dataloader, config):
             stage="future",
             num_epochs=stage2_epochs,
             ckpt_prefix="stage2_future",
-            start_epoch=resume_start_epoch if resume_stage_idx == 1 else 0,
+            start_epoch=stage2_start_epoch,
             resume_checkpoint=resume_checkpoint if resume_stage_idx == 1 else None,
         )
 
@@ -1174,6 +1180,39 @@ def train_bc_three_stage(train_dataloader, val_dataloader, config):
     torch.save(best_state_dict, os.path.join(ckpt_dir, "policy_best.ckpt"))
     print(f"Best three-stage ckpt, stage 3 val loss {min_val_loss:.6f} @ epoch{best_epoch}")
     return stage3_best_info
+
+
+def init_codebook_kmeans(policy, train_dataloader, device, n_batches=200, n_iter=50):
+    """Initialize the VQ codebook via k-means on training-set encoder outputs.
+
+    Collects pre-quantization vectors from `n_batches` training batches, then
+    runs GPU k-means and sets the codebook weights to the resulting centroids.
+    Only runs if the policy model exposes a `memory_quantizer` attribute.
+    """
+    if not hasattr(policy.model, "memory_quantizer"):
+        return
+    k = policy.model.memory_quantizer.codebook_bins
+    print(f"\nK-means codebook init: collecting encoder outputs from {n_batches} batches (k={k})...")
+
+    policy.eval()
+    all_vectors = []
+    with torch.no_grad():
+        for batch_idx, data in enumerate(train_dataloader):
+            if batch_idx >= n_batches:
+                break
+            image_data = data[0].to(device)
+            qpos_data = data[1].to(device)
+            vecs = policy.model.collect_code_inputs(image_data, qpos_data)
+            all_vectors.append(vecs)
+
+    all_vectors = torch.cat(all_vectors, dim=0)
+    print(f"  Collected {all_vectors.shape[0]} vectors of dim {all_vectors.shape[1]}")
+    policy.model.memory_quantizer.init_from_data(all_vectors, n_iter=n_iter)
+    # VQ loss should be active from stage 2 epoch 0 onwards — the warmup was
+    # intended to protect against the bad random initialization, which is now
+    # replaced by k-means centroids.
+    policy.vq_warmup_epochs = 0
+    policy.train()
 
 
 def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed, prefix=""):

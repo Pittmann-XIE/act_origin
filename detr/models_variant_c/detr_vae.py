@@ -172,6 +172,71 @@ class VectorQuantizer(nn.Module):
     def decode(self, codes):
         return self.embedding(codes)
 
+    def init_from_data(self, vectors, n_iter=50):
+        """Initialize codebook weights via k-means on collected encoder output vectors.
+
+        Args:
+            vectors: Float tensor of shape [N, codebook_dim] on any device.
+            n_iter:  Maximum Lloyd's iterations.
+        Returns:
+            Number of non-empty clusters in the final assignment.
+        """
+        k, d = self.codebook_bins, self.codebook_dim
+        n = vectors.shape[0]
+        assert vectors.shape[1] == d, f"Expected codebook_dim={d}, got {vectors.shape[1]}"
+        device = vectors.device
+
+        # Seed centroids from random data points to guarantee all start populated.
+        perm = torch.randperm(n, device=device)[:k]
+        centroids = vectors[perm].clone()
+
+        # Chunk distance computation to avoid materialising an [N, k] matrix at once.
+        chunk = 4096
+        c_sq = centroids.pow(2).sum(dim=1)
+
+        for it in range(n_iter):
+            # Assignment step
+            assignments = torch.empty(n, dtype=torch.long, device=device)
+            for start in range(0, n, chunk):
+                v = vectors[start : start + chunk]
+                dists = v.pow(2).sum(1, keepdim=True) - 2.0 * (v @ centroids.t()) + c_sq
+                assignments[start : start + chunk] = dists.argmin(dim=1)
+
+            # Update step
+            new_centroids = torch.zeros_like(centroids)
+            counts = torch.zeros(k, device=device)
+            new_centroids.scatter_add_(0, assignments.unsqueeze(1).expand(-1, d), vectors)
+            counts.scatter_add_(0, assignments, torch.ones(n, device=device))
+
+            # Re-seed empty clusters from random data points.
+            empty = counts == 0
+            n_empty = int(empty.sum())
+            if n_empty:
+                rand_idx = torch.randperm(n, device=device)[:n_empty]
+                new_centroids[empty] = vectors[rand_idx]
+                counts[empty] = 1.0
+
+            new_centroids /= counts.unsqueeze(1)
+            shift = (centroids - new_centroids).norm(dim=1).mean().item()
+            centroids = new_centroids
+            c_sq = centroids.pow(2).sum(dim=1)
+
+            if shift < 1e-6:
+                print(f"  K-means converged at iteration {it + 1} (mean centroid shift {shift:.2e})")
+                break
+
+        self.embedding.weight.data.copy_(centroids)
+
+        # Final assignment to report utilization.
+        final_assignments = torch.empty(n, dtype=torch.long, device=device)
+        for start in range(0, n, chunk):
+            v = vectors[start : start + chunk]
+            dists = v.pow(2).sum(1, keepdim=True) - 2.0 * (v @ centroids.t()) + c_sq
+            final_assignments[start : start + chunk] = dists.argmin(dim=1)
+        n_used = int(final_assignments.unique().numel())
+        print(f"  Codebook initialized from {n} vectors: {n_used}/{k} clusters populated")
+        return n_used
+
 
 class DETRVAE(nn.Module):
     def __init__(
@@ -483,6 +548,40 @@ class DETRVAE(nn.Module):
         flat_images = future_images.reshape(bs * num_frames, channels, height, width)
         flat_targets = self._encode_ema_target(flat_images)
         return flat_targets.reshape(bs, num_frames, self.hidden_dim)
+
+    @torch.no_grad()
+    def collect_code_inputs(self, image_data, qpos_data):
+        """Run backbone + transformer encoder + projection and return pre-VQ vectors.
+
+        Uses a zero action latent (matching inference behaviour).
+
+        Returns:
+            Float tensor of shape [batch * seq_len, codebook_dim].
+        """
+        bs = qpos_data.shape[0]
+        all_cam_features, all_cam_pos = [], []
+        for cam_id in range(len(self.camera_names)):
+            features, pos = self.backbones[cam_id](image_data[:, cam_id])
+            features = self.visual_fusion(features)
+            all_cam_features.append(features)
+            all_cam_pos.append(pos[-1])
+
+        latent_input = self.latent_out_proj(
+            torch.zeros(bs, self.latent_dim, dtype=qpos_data.dtype, device=qpos_data.device)
+        )
+        proprio_input = self.input_proj_robot_state(qpos_data)
+
+        src = torch.cat(all_cam_features, dim=3)
+        pos_feat = torch.cat(all_cam_pos, dim=3)
+        src_flat = src.flatten(2).permute(2, 0, 1)
+        pos_flat = pos_feat.flatten(2).permute(2, 0, 1).repeat(1, bs, 1)
+        additional_pos_embed = self.additional_pos_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+        pos_full = torch.cat([additional_pos_embed, pos_flat], dim=0)
+        src_full = torch.cat([torch.stack([latent_input, proprio_input], dim=0), src_flat], dim=0)
+
+        memory = self.transformer.encoder(src_full, src_key_padding_mask=None, pos=pos_full)
+        code_input = self.memory_to_code(memory)  # [seq_len, bs, codebook_dim]
+        return code_input.permute(1, 0, 2).reshape(-1, self.codebook_dim)
 
     def _run_future_branch(self, memory, feat_h, feat_w, action_sequence, detach_actions=False):
         bs = memory.shape[1]
