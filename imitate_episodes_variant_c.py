@@ -1,3 +1,65 @@
+"""
+Variant C: ACT with RQ-compressed shared communication payload and future prediction.
+
+Key changes vs baseline ACT
+-----------------------------
+1. ResidualQuantizer (RQ) replaces VectorQuantizer.
+   - 4 stages of greedy residual VQ; each stage quantizes the residual from the previous.
+   - K=512 codes per stage, D=128 codebook dim.
+   - Cascaded k-means initialisation at the start of stage 2 (one k-means pass per stage,
+     each on the residuals left by prior stages).
+   - Quantisation dropout during training: 50/25/15/10% probability of using 4/3/2/1 active
+     stages, so the model learns to work with partial transmissions.
+   - Dead-code restart: every 500 optimiser steps, codes used less than 7% of their expected
+     frequency are re-initialised with random data vectors.
+
+2. Shared quantised payload P (32 tokens = 2 special + 30 visual).
+   The encoder produces 300 visual tokens (ResNet18 stride-32 on 480×640 → 15×20 feature
+   map).  These are spatially pooled with 2D AdaptiveAvgPool to a 5×6=30-token grid, then
+   projected and RQ-quantised.  The resulting 32 tokens are P — the sole communication
+   channel from encoder to decoders.  Both the action decoder and the future predictor draw
+   their inputs exclusively from P.
+
+3. Future prediction branch.
+   Action-conditioned multi-horizon RGB and latent prediction at configurable horizons
+   (default: 0, 5, 15, 30, 60, 99 steps ahead).  The branch cross-attends to P and is
+   conditioned on the predicted (or teacher-forced) action sequence.
+
+Training data flow  (--three_stage)
+-------------------------------------
+Stage 1 — "act"  (stage1_act_*.ckpt)
+  Image ──► ResNet18 ──► 15×20 feature map ──► transformer encoder
+        ──► 302 tokens (2 special + 300 visual, UNQUANTISED)
+        ──► DETR action decoder ──► action predictions
+  RQ is not updated; quantisation is bypassed entirely so commit-loss gradients
+  cannot corrupt early action learning.
+
+Stage 2 — "future"  (stage2_future_*.ckpt)
+  Image ──► ResNet18 ──► transformer encoder ──► 302 tokens
+        ──► 2D pool 15×20 → 5×6 ──► rq_pos_embed ──► memory_to_code (MLP + LayerNorm)
+        ──► ResidualQuantizer (4 stages) ──► code_to_memory
+        ──► shared P  (32 quantised tokens)
+                ├──► DETR action decoder ──► action predictions
+                └──► future predictor   ──► multi-horizon RGB + latent predictions
+  Cascaded k-means init runs once at epoch 0.
+  Action parameters are frozen; only RQ, projections, and future branch are trained.
+
+Stage 3 — "joint"  (stage3_joint_*.ckpt)
+  Same data flow as stage 2.  All parameters fine-tuned together.
+  Dead-code restart active throughout this stage.
+
+Inference data flow
+--------------------
+  Image ──► ResNet18 ──► transformer encoder ──► 302 tokens
+        ──► 2D pool → 5×6 ──► RQ (all 4 stages) ──► P (32 tokens)
+        ──► DETR action decoder ──► action chunk (chunk_size steps)
+  Future RGB visualisation is also generated from the same P.
+
+Communication bottleneck
+-------------------------
+  32 tokens × 4 stages × log₂(512) = 32 × 4 × 9 = 1,152 bits per observation frame.
+  At 30 Hz control rate: ~34.6 kbps.
+"""
 import argparse
 import cv2
 import json
@@ -135,6 +197,12 @@ def main(args):
             "lambda_vq": args["lambda_vq"],
             "lambda_vq_commit": args["lambda_vq_commit"],
             "vq_warmup_epochs": args["vq_warmup_epochs"],
+            "rq_num_tokens": args["rq_num_tokens"],
+            "rq_num_stages": args["rq_num_stages"],
+            "rq_codebook_bins": args["rq_codebook_bins"],
+            "rq_dropout_probs": args["rq_dropout_probs"],
+            "rq_dead_code_restart_interval": args["rq_dead_code_restart_interval"],
+            "rq_dead_code_restart_threshold": args["rq_dead_code_restart_threshold"],
         }
     elif policy_class == "CNNMLP":
         policy_config = {
@@ -855,7 +923,7 @@ def train_bc(train_dataloader, val_dataloader, config):
                 if hasattr(policy, "update_ema"):
                     policy.update_ema()
                 optimizer.zero_grad(set_to_none=True)
-            train_history.append(scalarize_dict(forward_dict))
+                train_history.append(scalarize_dict(forward_dict))
         epoch_summary = compute_dict_mean(train_history[epoch_start_idx:])
         epoch_train_loss = epoch_summary["loss"]
         print(f"Train loss: {epoch_train_loss:.5f}")
@@ -976,8 +1044,10 @@ def train_stage(
                 optimizer.step()
                 if hasattr(policy, "update_ema"):
                     policy.update_ema()
+                if hasattr(policy, "should_restart_dead_codes") and policy.should_restart_dead_codes():
+                    policy.maybe_restart_dead_codes(data[0], data[1], device)
                 optimizer.zero_grad(set_to_none=True)
-            train_history.append(scalarize_dict(forward_dict))
+                train_history.append(scalarize_dict(forward_dict))
         epoch_summary = compute_dict_mean(train_history[epoch_start_idx:])
         epoch_train_loss = epoch_summary["loss"]
         print(f"Train loss: {epoch_train_loss:.5f}")
@@ -1183,16 +1253,21 @@ def train_bc_three_stage(train_dataloader, val_dataloader, config):
 
 
 def init_codebook_kmeans(policy, train_dataloader, device, n_batches=200, n_iter=50):
-    """Initialize the VQ codebook via k-means on training-set encoder outputs.
+    """Initialize the RQ codebook via cascaded k-means on training-set encoder outputs.
 
-    Collects pre-quantization vectors from `n_batches` training batches, then
-    runs GPU k-means and sets the codebook weights to the resulting centroids.
-    Only runs if the policy model exposes a `memory_quantizer` attribute.
+    Collects pre-quantization vectors from `n_batches` training batches (pooled +
+    projected, shape [B*32, D=128]), then runs cascaded GPU k-means and sets the
+    per-stage codebook weights. Only runs if the policy model exposes a
+    `memory_quantizer` attribute.
     """
     if not hasattr(policy.model, "memory_quantizer"):
         return
-    k = policy.model.memory_quantizer.codebook_bins
-    print(f"\nK-means codebook init: collecting encoder outputs from {n_batches} batches (k={k})...")
+    rq = policy.model.memory_quantizer
+    k = rq.codebook_bins
+    print(
+        f"\nRQ cascaded k-means init: collecting from {n_batches} batches "
+        f"(k={k}, D={rq.codebook_dim}, stages={rq.num_stages})..."
+    )
 
     policy.eval()
     all_vectors = []
@@ -1207,10 +1282,8 @@ def init_codebook_kmeans(policy, train_dataloader, device, n_batches=200, n_iter
 
     all_vectors = torch.cat(all_vectors, dim=0)
     print(f"  Collected {all_vectors.shape[0]} vectors of dim {all_vectors.shape[1]}")
-    policy.model.memory_quantizer.init_from_data(all_vectors, n_iter=n_iter)
-    # VQ loss should be active from stage 2 epoch 0 onwards — the warmup was
-    # intended to protect against the bad random initialization, which is now
-    # replaced by k-means centroids.
+    rq.init_from_data(all_vectors, n_iter=n_iter)
+    # RQ loss active from stage 2 epoch 0 — k-means init replaces warmup protection
     policy.vq_warmup_epochs = 0
     policy.train()
 
@@ -1279,11 +1352,18 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_future_rgb", action="store", type=float, default=1.0)
     parser.add_argument("--lambda_future_grad", action="store", type=float, default=0.25)
     parser.add_argument("--lambda_future_latent", action="store", type=float, default=0.1)
-    parser.add_argument("--codebook_bins", action="store", type=int, default=1024)
-    parser.add_argument("--codebook_dim", action="store", type=int, default=None)
+    parser.add_argument("--codebook_bins", action="store", type=int, default=512)
+    parser.add_argument("--codebook_dim", action="store", type=int, default=128)
     parser.add_argument("--lambda_vq", action="store", type=float, default=1.0)
     parser.add_argument("--lambda_vq_commit", action="store", type=float, default=0.25)
     parser.add_argument("--vq_warmup_epochs", action="store", type=int, default=0)
+    parser.add_argument("--rq_num_tokens", action="store", type=int, default=30)
+    parser.add_argument("--rq_num_stages", action="store", type=int, default=4)
+    parser.add_argument("--rq_codebook_bins", action="store", type=int, default=512)
+    parser.add_argument("--rq_dropout_probs", action="store", type=float, nargs="+",
+                        default=[0.50, 0.25, 0.15, 0.10])
+    parser.add_argument("--rq_dead_code_restart_interval", action="store", type=int, default=500)
+    parser.add_argument("--rq_dead_code_restart_threshold", action="store", type=float, default=0.07)
     parser.add_argument("--resume_ckpt", action="store", type=str, default=None)
     parser.add_argument("--grad_accum_steps", action="store", type=int, default=1)
     parser.add_argument("--export_netron_onnx", action="store", type=str, default=None)

@@ -1,6 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 """
-Variant C ACT model with VQ-compressed encoder memory.
+Variant C ACT model with RQ-compressed encoder memory.
 """
 import copy
 
@@ -173,42 +173,30 @@ class VectorQuantizer(nn.Module):
         return self.embedding(codes)
 
     def init_from_data(self, vectors, n_iter=50):
-        """Initialize codebook weights via k-means on collected encoder output vectors.
-
-        Args:
-            vectors: Float tensor of shape [N, codebook_dim] on any device.
-            n_iter:  Maximum Lloyd's iterations.
-        Returns:
-            Number of non-empty clusters in the final assignment.
-        """
+        """Initialize codebook weights via k-means on collected encoder output vectors."""
         k, d = self.codebook_bins, self.codebook_dim
         n = vectors.shape[0]
         assert vectors.shape[1] == d, f"Expected codebook_dim={d}, got {vectors.shape[1]}"
         device = vectors.device
 
-        # Seed centroids from random data points to guarantee all start populated.
         perm = torch.randperm(n, device=device)[:k]
         centroids = vectors[perm].clone()
 
-        # Chunk distance computation to avoid materialising an [N, k] matrix at once.
         chunk = 4096
         c_sq = centroids.pow(2).sum(dim=1)
 
         for it in range(n_iter):
-            # Assignment step
             assignments = torch.empty(n, dtype=torch.long, device=device)
             for start in range(0, n, chunk):
                 v = vectors[start : start + chunk]
                 dists = v.pow(2).sum(1, keepdim=True) - 2.0 * (v @ centroids.t()) + c_sq
                 assignments[start : start + chunk] = dists.argmin(dim=1)
 
-            # Update step
             new_centroids = torch.zeros_like(centroids)
             counts = torch.zeros(k, device=device)
             new_centroids.scatter_add_(0, assignments.unsqueeze(1).expand(-1, d), vectors)
             counts.scatter_add_(0, assignments, torch.ones(n, device=device))
 
-            # Re-seed empty clusters from random data points.
             empty = counts == 0
             n_empty = int(empty.sum())
             if n_empty:
@@ -227,7 +215,6 @@ class VectorQuantizer(nn.Module):
 
         self.embedding.weight.data.copy_(centroids)
 
-        # Final assignment to report utilization.
         final_assignments = torch.empty(n, dtype=torch.long, device=device)
         for start in range(0, n, chunk):
             v = vectors[start : start + chunk]
@@ -236,6 +223,92 @@ class VectorQuantizer(nn.Module):
         n_used = int(final_assignments.unique().numel())
         print(f"  Codebook initialized from {n} vectors: {n_used}/{k} clusters populated")
         return n_used
+
+
+class ResidualQuantizer(nn.Module):
+    """Multi-stage residual vector quantizer. Stage i quantizes the residual from stage i-1."""
+
+    def __init__(self, num_stages, codebook_bins, codebook_dim):
+        super().__init__()
+        self.num_stages = num_stages
+        self.codebook_bins = int(codebook_bins)
+        self.codebook_dim = int(codebook_dim)
+        self.stages = nn.ModuleList(
+            [VectorQuantizer(codebook_bins, codebook_dim) for _ in range(num_stages)]
+        )
+
+    def forward(self, x, num_active_stages=None):
+        """Greedy sequential quantization with optional stage dropout.
+
+        Args:
+            x: Input tensor of shape (..., codebook_dim).
+            num_active_stages: Number of stages to use (1..num_stages). None = all stages.
+        Returns:
+            Dict with keys: quantized, codes, codebook_loss, commitment_loss,
+                            perplexity (stage-1), stage_perplexities (list).
+        """
+        if num_active_stages is None:
+            num_active_stages = self.num_stages
+        original_shape = x.shape
+        flat_x = x.reshape(-1, self.codebook_dim)
+
+        residual = flat_x
+        quantized_sum = torch.zeros_like(flat_x)
+        total_codebook_loss = torch.zeros((), device=x.device, dtype=x.dtype)
+        total_commitment_loss = torch.zeros((), device=x.device, dtype=x.dtype)
+        stage_perplexities = []
+        all_codes = []
+
+        for i, stage in enumerate(self.stages):
+            if i >= num_active_stages:
+                # Dropped stage: contribute zero codes (no codebook entry 0 is added)
+                all_codes.append(torch.zeros(flat_x.shape[0], dtype=torch.long, device=x.device))
+                stage_perplexities.append(torch.zeros((), device=x.device, dtype=x.dtype))
+                continue
+            result = stage(residual)
+            quantized_stage = result["quantized"]
+            quantized_sum = quantized_sum + quantized_stage
+            residual = (residual - quantized_stage).detach()
+            total_codebook_loss = total_codebook_loss + result["codebook_loss"]
+            total_commitment_loss = total_commitment_loss + result["commitment_loss"]
+            stage_perplexities.append(result["perplexity"])
+            all_codes.append(result["codes"])
+
+        codes_stack = torch.stack(all_codes, dim=-1)  # (N, num_stages)
+
+        return {
+            "quantized": quantized_sum.reshape(original_shape),
+            "codes": codes_stack.reshape(original_shape[:-1] + (self.num_stages,)),
+            "codebook_loss": total_codebook_loss / max(1, num_active_stages),
+            "commitment_loss": total_commitment_loss / max(1, num_active_stages),
+            "perplexity": stage_perplexities[0],
+            "stage_perplexities": stage_perplexities,
+        }
+
+    def decode(self, codes):
+        """Decode RQ codes to vectors. codes: (..., num_stages) → (..., codebook_dim)."""
+        result = torch.zeros(*codes.shape[:-1], self.codebook_dim, device=codes.device, dtype=torch.float32)
+        for i, stage in enumerate(self.stages):
+            result = result + stage.decode(codes[..., i])
+        return result
+
+    def init_from_data(self, vectors, n_iter=50):
+        """Cascaded k-means: stage 1 on vectors, stage 2 on stage-1 residuals, etc."""
+        residual = vectors.clone()
+        for i, stage in enumerate(self.stages):
+            print(f"  RQ stage {i + 1}/{self.num_stages}: k-means init on residuals...")
+            stage.init_from_data(residual, n_iter=n_iter)
+            with torch.no_grad():
+                flat = residual.reshape(-1, self.codebook_dim)
+                c_sq = stage.embedding.weight.pow(2).sum(dim=1)
+                chunk = 4096
+                quantized = torch.zeros_like(flat)
+                for start in range(0, flat.shape[0], chunk):
+                    v = flat[start : start + chunk]
+                    dists = v.pow(2).sum(1, keepdim=True) - 2.0 * (v @ stage.embedding.weight.t()) + c_sq
+                    codes = dists.argmin(dim=1)
+                    quantized[start : start + chunk] = stage.embedding(codes)
+                residual = flat - quantized
 
 
 class DETRVAE(nn.Module):
@@ -256,6 +329,9 @@ class DETRVAE(nn.Module):
         future_layers,
         codebook_bins,
         codebook_dim,
+        rq_num_tokens=30,
+        rq_num_stages=4,
+        rq_codebook_bins=512,
     ):
         super().__init__()
         self.num_queries = num_queries
@@ -271,6 +347,7 @@ class DETRVAE(nn.Module):
         self.hidden_dim = transformer.d_model
         self.codebook_bins = int(codebook_bins)
         self.codebook_dim = self.hidden_dim if codebook_dim is None else int(codebook_dim)
+        self.rq_num_tokens = int(rq_num_tokens)
         self.action_head = nn.Linear(self.hidden_dim, state_dim)
         self.is_pad_head = nn.Linear(self.hidden_dim, 1)
         self.query_embed = nn.Embedding(num_queries, self.hidden_dim)
@@ -296,14 +373,19 @@ class DETRVAE(nn.Module):
         )
         self.latent_out_proj = nn.Linear(self.latent_dim, self.hidden_dim)
         self.additional_pos_embed = nn.Embedding(2, self.hidden_dim)
-        self.memory_to_code = (
-            nn.Identity() if self.codebook_dim == self.hidden_dim else nn.Linear(self.hidden_dim, self.codebook_dim)
+
+        # RQ modules: positional encoding for the 2+rq_num_tokens pooled tokens
+        self.rq_pos_embed = nn.Embedding(2 + self.rq_num_tokens, self.hidden_dim)
+        # Projection in: hidden_dim → codebook_dim (MLP + LayerNorm for stable quantizer input)
+        self.memory_to_code = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.codebook_dim),
+            nn.GELU(),
+            nn.Linear(self.codebook_dim, self.codebook_dim),
+            nn.LayerNorm(self.codebook_dim),
         )
-        self.code_to_memory = (
-            nn.Identity() if self.codebook_dim == self.hidden_dim else nn.Linear(self.codebook_dim, self.hidden_dim)
-        )
-        self.memory_quantizer = VectorQuantizer(self.codebook_bins, self.codebook_dim)
-        self._cached_pos_full = None
+        # Projection out: codebook_dim → hidden_dim
+        self.code_to_memory = nn.Linear(self.codebook_dim, self.hidden_dim)
+        self.memory_quantizer = ResidualQuantizer(rq_num_stages, rq_codebook_bins, self.codebook_dim)
 
         self.comm_query_embed = nn.Embedding(comm_num_queries, self.hidden_dim)
         self.comm_task_token = nn.Embedding(1, self.hidden_dim)
@@ -408,24 +490,70 @@ class DETRVAE(nn.Module):
             "codebook_loss": scalar,
             "commitment_loss": scalar,
             "perplexity": scalar,
+            "stage_perplexities": None,
         }
 
-    def _quantize_memory(self, memory):
-        code_input = self.memory_to_code(memory)
-        vq_result = self.memory_quantizer(code_input)
-        quantized_memory = self.code_to_memory(vq_result["quantized"])
-        return quantized_memory, {
-            "codes": vq_result["codes"],
-            "codebook_loss": vq_result["codebook_loss"],
-            "commitment_loss": vq_result["commitment_loss"],
-            "perplexity": vq_result["perplexity"],
+    def _pool_grid_size(self, feat_h, feat_w):
+        """Find (grid_h, grid_w) with grid_h*grid_w == rq_num_tokens that best preserves feat_h/feat_w aspect ratio."""
+        N = self.rq_num_tokens
+        target = feat_h / feat_w
+        best, best_err = (1, N), float("inf")
+        for h in range(1, N + 1):
+            if N % h == 0:
+                w = N // h
+                err = abs(h / w - target)
+                if err < best_err:
+                    best_err = err
+                    best = (h, w)
+        return best
+
+    def _pool_visual_tokens(self, memory, feat_h, feat_w):
+        """2D-pool target-camera visual tokens from full encoder memory to rq_num_tokens.
+
+        Uses AdaptiveAvgPool2d to preserve spatial structure (e.g. 15×20 → 5×6 for rq_num_tokens=30).
+        memory: (seq_len, B, H) where seq_len = 2 + total_visual_tokens
+        Returns: (2 + rq_num_tokens, B, H)
+        """
+        special = memory[:2]  # (2, B, H): CVAE latent + proprioception
+        num_target_cam_tokens = feat_h * feat_w
+        visual_start = 2 + self.target_camera_idx * num_target_cam_tokens
+        visual_end = visual_start + num_target_cam_tokens
+        target_visual = memory[visual_start:visual_end]  # (feat_h*feat_w, B, H)
+        B, H = target_visual.shape[1], target_visual.shape[2]
+        # Reshape to 2D spatial grid and apply 2D pooling to preserve horizontal+vertical structure
+        grid = target_visual.permute(1, 2, 0).reshape(B, H, feat_h, feat_w)  # (B, H, feat_h, feat_w)
+        grid_h, grid_w = self._pool_grid_size(feat_h, feat_w)
+        pooled = F.adaptive_avg_pool2d(grid, (grid_h, grid_w))  # (B, H, grid_h, grid_w)
+        pooled = pooled.reshape(B, H, -1).permute(2, 0, 1)  # (rq_num_tokens, B, H)
+        return torch.cat([special, pooled], dim=0)  # (2 + rq_num_tokens, B, H)
+
+    def _quantize_memory(self, memory, feat_h, feat_w, num_active_stages=None):
+        """2D-pool visual tokens, add positional encoding, project, and RQ-quantize.
+
+        Returns rq_memory (2+rq_num_tokens, B, hidden_dim) and vq_outputs dict.
+        """
+        pooled = self._pool_visual_tokens(memory, feat_h, feat_w)  # (2+rq_num_tokens, B, H)
+        # Add learned positional encoding so the quantizer and future decoder know token positions
+        pos_idx = torch.arange(pooled.shape[0], device=memory.device)
+        pooled = pooled + self.rq_pos_embed(pos_idx).unsqueeze(1)
+        code_input = self.memory_to_code(pooled)  # (2+rq_num_tokens, B, D=codebook_dim)
+        rq_result = self.memory_quantizer(code_input, num_active_stages=num_active_stages)
+        rq_memory = self.code_to_memory(rq_result["quantized"])  # (2+rq_num_tokens, B, H)
+        vq_outputs = {
+            "codes": rq_result["codes"],
+            "codebook_loss": rq_result["codebook_loss"],
+            "commitment_loss": rq_result["commitment_loss"],
+            "perplexity": rq_result["perplexity"],
+            "stage_perplexities": rq_result["stage_perplexities"],
         }
+        return rq_memory, vq_outputs
 
     def _decode_memory_codes(self, codes):
-        code_vectors = self.memory_quantizer.decode(codes)
-        return self.code_to_memory(code_vectors)
+        """Decode RQ codes back to rq_memory. codes: (rq_num_tokens+2, B, num_stages)."""
+        code_vectors = self.memory_quantizer.decode(codes)  # (32, B, codebook_dim)
+        return self.code_to_memory(code_vectors)  # (32, B, hidden_dim)
 
-    def _decode_from_memory(self, memory, pos_full):
+    def _decode_from_memory(self, memory, pos=None):
         bs = memory.shape[1]
         query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
         tgt = torch.zeros_like(query_embed)
@@ -433,12 +561,16 @@ class DETRVAE(nn.Module):
             tgt,
             memory,
             memory_key_padding_mask=None,
-            pos=pos_full,
+            pos=pos,
             query_pos=query_embed,
         )
         return hs.transpose(1, 2), attn_weights
 
-    def _encode_visual_tokens(self, qpos, image, latent_input, use_quantized_memory=True):
+    def _rq_pos_for_decode(self, seq_len, bs, device):
+        """Returns (seq_len, B, hidden_dim) positional encoding for P quantized tokens."""
+        return self.rq_pos_embed.weight[:seq_len].unsqueeze(1).expand(-1, bs, -1)
+
+    def _encode_visual_tokens(self, qpos, image, latent_input, use_quantized_memory=True, num_active_rq_stages=None):
         bs, _, _, _, _ = image.shape
         all_cam_features = []
         all_cam_pos = []
@@ -461,10 +593,21 @@ class DETRVAE(nn.Module):
         src_full = torch.cat([torch.stack([latent_input, proprio_input], axis=0), src_flat], axis=0)
 
         memory = self.transformer.encoder(src_full, src_key_padding_mask=None, pos=pos_full)
-        quantized_memory, vq_outputs = self._quantize_memory(memory)
-        memory_for_decode = quantized_memory if use_quantized_memory else memory
-        hs, attn_weights = self._decode_from_memory(memory_for_decode, pos_full)
-        return hs, attn_weights, memory, memory_for_decode, vq_outputs, pos_full, feat_h, feat_w
+
+        # When quantized: both action decoder and future/comm branch use the shared quantized
+        # payload P.  When not quantized (stage1): action decoder uses full unquantized memory.
+        if use_quantized_memory:
+            rq_memory, vq_outputs = self._quantize_memory(
+                memory, feat_h, feat_w, num_active_stages=num_active_rq_stages
+            )
+            rq_pos = self._rq_pos_for_decode(rq_memory.shape[0], bs, memory.device)
+            hs, attn_weights = self._decode_from_memory(rq_memory, pos=rq_pos)
+        else:
+            rq_memory = None
+            vq_outputs = self._empty_vq_outputs(memory)
+            hs, attn_weights = self._decode_from_memory(memory, pos=pos_full)
+
+        return hs, attn_weights, rq_memory, vq_outputs, pos_full, feat_h, feat_w
 
     def encode_memory_codes(self, qpos, image, actions=None, is_pad=None):
         if actions is not None and is_pad is not None:
@@ -473,39 +616,39 @@ class DETRVAE(nn.Module):
             bs = qpos.shape[0]
             latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32, device=qpos.device)
             latent_input = self.latent_out_proj(latent_sample)
-        _, _, _, _, vq_outputs, pos_full, feat_h, feat_w = self._encode_visual_tokens(
+        _, _, rq_memory, vq_outputs, pos_full, feat_h, feat_w = self._encode_visual_tokens(
             qpos,
             image,
             latent_input,
             use_quantized_memory=True,
         )
-        self._cached_pos_full = pos_full.detach()
         return vq_outputs["codes"], feat_h, feat_w
 
     def decode_from_memory_codes(self, codes, feat_h, feat_w, batch_size, future_actions=None):
-        memory = self._decode_memory_codes(codes)
-        if memory.shape[1] != batch_size:
-            raise ValueError(f"codes batch size {memory.shape[1]} does not match batch_size {batch_size}")
-        pos_full = self._cached_pos_full
-        if pos_full is None or pos_full.shape[:2] != memory.shape[:2]:
-            raise ValueError("decode_from_memory_codes requires cached pos_full from encode_memory_codes first.")
+        rq_memory = self._decode_memory_codes(codes)  # (P, B, hidden_dim)
+        if rq_memory.shape[1] != batch_size:
+            raise ValueError(f"codes batch size {rq_memory.shape[1]} does not match batch_size {batch_size}")
 
-        hs, attn_weights = self._decode_from_memory(memory, pos_full.to(device=memory.device, dtype=memory.dtype))
+        # Action prediction from the same quantized payload P used during stage2/3 training
+        rq_pos = self._rq_pos_for_decode(rq_memory.shape[0], batch_size, rq_memory.device)
+        hs, _ = self._decode_from_memory(rq_memory, pos=rq_pos)
         hs = hs[-1]
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
-        comm_outputs = self._empty_comm_outputs(memory)
+
+        comm_outputs = self._empty_comm_outputs(rq_memory)
         if future_actions is not None:
-            future_rgb_hat, future_z_hat = self._run_future_branch(memory, feat_h, feat_w, future_actions)
+            future_rgb_hat, future_z_hat = self._run_future_branch(rq_memory, feat_h, feat_w, future_actions)
             comm_outputs["future_rgb_hat"] = future_rgb_hat
             comm_outputs["future_z_hat"] = future_z_hat
-        return a_hat, is_pad_hat, attn_weights, comm_outputs
+        return a_hat, is_pad_hat, None, comm_outputs
 
-    def _run_comm_branch(self, memory, feat_h, feat_w, detach_comm=False):
-        bs = memory.shape[1]
-        memory_bsd = memory.permute(1, 0, 2)
-        memory_prop = memory_bsd[:, 1:2, :]
-        memory_vis = memory_bsd[:, 2:, :]
+    def _run_comm_branch(self, rq_memory, feat_h, feat_w, detach_comm=False):
+        """Run comm branch using 32 pooled+quantized tokens from rq_memory."""
+        bs = rq_memory.shape[1]
+        rq_memory_bsd = rq_memory.permute(1, 0, 2)  # (B, 32, H)
+        memory_prop = rq_memory_bsd[:, 1:2, :]       # (B, 1, H) proprioception
+        memory_vis = rq_memory_bsd[:, 2:, :]         # (B, rq_num_tokens, H) pooled visual
         if detach_comm:
             memory_prop = memory_prop.detach()
             memory_vis = memory_vis.detach()
@@ -517,7 +660,7 @@ class DETRVAE(nn.Module):
         )
         comm_query = self.comm_query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
         comm_query = comm_query + cond.unsqueeze(0)
-        memory_vis_t = memory_vis.permute(1, 0, 2)
+        memory_vis_t = memory_vis.permute(1, 0, 2)  # (rq_num_tokens, B, H)
 
         for layer in self.comm_layers:
             comm_query = layer(comm_query, memory_vis_t)
@@ -525,11 +668,11 @@ class DETRVAE(nn.Module):
         z_comm = comm_query.transpose(0, 1)
         z_comm_pool = self.comm_pool_proj(z_comm.mean(dim=1))
 
-        tokens_per_camera = feat_h * feat_w
-        start_idx = self.target_camera_idx * tokens_per_camera
-        end_idx = start_idx + tokens_per_camera
-        target_tokens = memory_vis[:, start_idx:end_idx, :]
-        target_grid = target_tokens.transpose(1, 2).reshape(bs, self.hidden_dim, feat_h, feat_w)
+        # Reconstruct spatial grid from rq_num_tokens pooled tokens:
+        # reshape to 2D pool grid then upsample to (feat_h, feat_w)
+        grid_h, grid_w = self._pool_grid_size(feat_h, feat_w)
+        target_grid = memory_vis.transpose(1, 2).reshape(bs, self.hidden_dim, grid_h, grid_w)
+        target_grid = F.interpolate(target_grid, size=(feat_h, feat_w), mode="bilinear", align_corners=False)
 
         gamma, beta = self.comm_film(z_comm_pool).chunk(2, dim=-1)
         conditioned_grid = target_grid * (1.0 + gamma[:, :, None, None]) + beta[:, :, None, None]
@@ -551,18 +694,18 @@ class DETRVAE(nn.Module):
 
     @torch.no_grad()
     def collect_code_inputs(self, image_data, qpos_data):
-        """Run backbone + transformer encoder + projection and return pre-VQ vectors.
-
-        Uses a zero action latent (matching inference behaviour).
+        """Run backbone + encoder + pooling + projection and return pre-RQ vectors.
 
         Returns:
-            Float tensor of shape [batch * seq_len, codebook_dim].
+            Float tensor of shape [batch * (2 + rq_num_tokens), codebook_dim].
         """
         bs = qpos_data.shape[0]
         all_cam_features, all_cam_pos = [], []
+        feat_h = feat_w = None
         for cam_id in range(len(self.camera_names)):
             features, pos = self.backbones[cam_id](image_data[:, cam_id])
             features = self.visual_fusion(features)
+            feat_h, feat_w = features.shape[-2:]
             all_cam_features.append(features)
             all_cam_pos.append(pos[-1])
 
@@ -580,17 +723,23 @@ class DETRVAE(nn.Module):
         src_full = torch.cat([torch.stack([latent_input, proprio_input], dim=0), src_flat], dim=0)
 
         memory = self.transformer.encoder(src_full, src_key_padding_mask=None, pos=pos_full)
-        code_input = self.memory_to_code(memory)  # [seq_len, bs, codebook_dim]
-        return code_input.permute(1, 0, 2).reshape(-1, self.codebook_dim)
 
-    def _run_future_branch(self, memory, feat_h, feat_w, action_sequence, detach_actions=False):
-        bs = memory.shape[1]
+        # Pool visual tokens and apply positional encoding + projection (same as _quantize_memory)
+        pooled = self._pool_visual_tokens(memory, feat_h, feat_w)  # (2+rq_num_tokens, B, H)
+        pos_idx = torch.arange(pooled.shape[0], device=memory.device)
+        pooled = pooled + self.rq_pos_embed(pos_idx).unsqueeze(1)
+        code_input = self.memory_to_code(pooled)  # (32, B, D)
+        return code_input.permute(1, 0, 2).reshape(-1, self.codebook_dim)  # (B*32, D)
+
+    def _run_future_branch(self, rq_memory, feat_h, feat_w, action_sequence, detach_actions=False):
+        """Run future prediction branch using 32 pooled+quantized tokens from rq_memory."""
+        bs = rq_memory.shape[1]
         if detach_actions:
             action_sequence = action_sequence.detach()
 
-        memory_bsd = memory.permute(1, 0, 2)
-        memory_prop = memory_bsd[:, 1:2, :]
-        memory_vis = memory_bsd[:, 2:, :]
+        rq_memory_bsd = rq_memory.permute(1, 0, 2)  # (B, 32, H)
+        memory_prop = rq_memory_bsd[:, 1:2, :]       # (B, 1, H)
+        memory_vis = rq_memory_bsd[:, 2:, :]         # (B, rq_num_tokens, H)
 
         num_actions = min(action_sequence.shape[1], self.num_queries)
         action_tokens = self.future_action_proj(action_sequence[:, :num_actions])
@@ -599,8 +748,8 @@ class DETRVAE(nn.Module):
 
         horizon_tensor = torch.tensor(
             self.future_horizons,
-            dtype=memory.dtype,
-            device=memory.device,
+            dtype=rq_memory.dtype,
+            device=rq_memory.device,
         ).view(self.num_future_frames, 1)
         horizon_tensor = horizon_tensor / max(1, self.num_queries - 1)
         horizon_embed = self.future_horizon_proj(horizon_tensor).unsqueeze(1)
@@ -609,18 +758,18 @@ class DETRVAE(nn.Module):
 
         for action_layer, memory_layer in zip(self.future_action_layers, self.future_memory_layers):
             frame_query = action_layer(frame_query, action_tokens)
-            frame_query = memory_layer(frame_query, memory)
+            frame_query = memory_layer(frame_query, rq_memory)  # 32 bottleneck tokens
 
-        future_tokens = frame_query.transpose(0, 1)
+        future_tokens = frame_query.transpose(0, 1)  # (B, num_future_frames, H)
         future_z = self.future_pool_proj(future_tokens)
 
-        tokens_per_camera = feat_h * feat_w
-        start_idx = self.target_camera_idx * tokens_per_camera
-        end_idx = start_idx + tokens_per_camera
-        target_tokens = memory_vis[:, start_idx:end_idx, :]
-        target_grid = target_tokens.transpose(1, 2).reshape(bs, self.hidden_dim, feat_h, feat_w)
+        # Reconstruct spatial grid from rq_num_tokens pooled tokens:
+        # reshape to 2D pool grid then upsample to (feat_h, feat_w)
+        grid_h, grid_w = self._pool_grid_size(feat_h, feat_w)
+        target_grid = memory_vis.transpose(1, 2).reshape(bs, self.hidden_dim, grid_h, grid_w)
+        target_grid = F.interpolate(target_grid, size=(feat_h, feat_w), mode="bilinear", align_corners=False)
 
-        gamma, beta = self.future_film(future_z).chunk(2, dim=-1)
+        gamma, beta = self.future_film(future_z).chunk(2, dim=-1)  # (B, num_frames, H)
         base_grid = target_grid.unsqueeze(1).expand(-1, self.num_future_frames, -1, -1, -1)
         conditioned_grid = base_grid * (1.0 + gamma[:, :, :, None, None]) + beta[:, :, :, None, None]
         conditioned_grid = conditioned_grid.reshape(bs * self.num_future_frames, self.hidden_dim, feat_h, feat_w)
@@ -657,6 +806,7 @@ class DETRVAE(nn.Module):
         run_future=True,
         encode_target_semantics=True,
         use_quantized_memory=True,
+        num_active_rq_stages=None,
     ):
         is_training = actions is not None and not force_zero_latent
         bs, _ = qpos.shape
@@ -669,19 +819,19 @@ class DETRVAE(nn.Module):
             latent_input = self.latent_out_proj(latent_sample)
 
         if self.backbones is not None:
-            hs, attn_weights, memory, memory_for_decode, vq_outputs, _, feat_h, feat_w = self._encode_visual_tokens(
+            hs, attn_weights, rq_memory, vq_outputs, _, feat_h, feat_w = self._encode_visual_tokens(
                 qpos,
                 image,
                 latent_input,
                 use_quantized_memory=use_quantized_memory,
+                num_active_rq_stages=num_active_rq_stages,
             )
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
             transformer_input = torch.cat([qpos, env_state], axis=1)
             hs, attn_weights = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)
-            memory = None
-            memory_for_decode = None
+            rq_memory = None
             feat_h = feat_w = None
             vq_outputs = self._empty_vq_outputs(qpos)
 
@@ -696,19 +846,20 @@ class DETRVAE(nn.Module):
                 "vq_loss": vq_outputs["codebook_loss"],
                 "vq_commitment_loss": vq_outputs["commitment_loss"],
                 "vq_perplexity": vq_outputs["perplexity"],
+                "vq_stage_perplexities": vq_outputs["stage_perplexities"],
             }
         )
-        if run_comm and memory_for_decode is not None and feat_h is not None and feat_w is not None:
-            roi_hat, z_comm_pool = self._run_comm_branch(memory_for_decode, feat_h, feat_w, detach_comm=detach_comm)
+        if run_comm and rq_memory is not None and feat_h is not None and feat_w is not None:
+            roi_hat, z_comm_pool = self._run_comm_branch(rq_memory, feat_h, feat_w, detach_comm=detach_comm)
             comm_outputs["roi_hat"] = roi_hat
             comm_outputs["z_comm_pool"] = z_comm_pool
             if encode_target_semantics and target_image is not None:
                 comm_outputs["z_target_pool"] = self._encode_ema_target(target_image)
 
-        if run_future and memory_for_decode is not None and feat_h is not None and feat_w is not None:
+        if run_future and rq_memory is not None and feat_h is not None and feat_w is not None:
             action_condition = a_hat if future_actions is None else future_actions
             future_rgb_hat, future_z_hat = self._run_future_branch(
-                memory_for_decode,
+                rq_memory,
                 feat_h,
                 feat_w,
                 action_condition,
@@ -734,6 +885,7 @@ class DETRVAE(nn.Module):
             "vq_loss": scalar,
             "vq_commitment_loss": scalar,
             "vq_perplexity": scalar,
+            "vq_stage_perplexities": None,
         }
 
 
@@ -822,8 +974,11 @@ def build(args):
         future_image_height=getattr(args, "future_image_height", 240),
         future_image_width=getattr(args, "future_image_width", 320),
         future_layers=getattr(args, "future_layers", 2),
-        codebook_bins=getattr(args, "codebook_bins", 1024),
-        codebook_dim=getattr(args, "codebook_dim", None),
+        codebook_bins=getattr(args, "codebook_bins", 512),
+        codebook_dim=getattr(args, "codebook_dim", 128),
+        rq_num_tokens=getattr(args, "rq_num_tokens", 30),
+        rq_num_stages=getattr(args, "rq_num_stages", 4),
+        rq_codebook_bins=getattr(args, "rq_codebook_bins", 512),
     )
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("number of parameters: %.2fM" % (n_parameters / 1e6,))
