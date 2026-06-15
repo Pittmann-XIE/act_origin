@@ -13,7 +13,7 @@
 set -eo pipefail
 
 echo "Job running on node: $SLURM_JOB_NODELIST"
-echo "Starting Variant C ACT training with VQ-compressed memory..."
+echo "Starting Variant C ACT training with RQ-compressed memory..."
 
 source ~/.bashrc
 conda activate python311t
@@ -25,15 +25,19 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 TASK_NAME="sim_transfer_cube_scripted"
 TARGET_CAMERA="top"
-CODEBOOK_BINS=256
-CODEBOOK_DIM=256
-VQ_WARMUP_EPOCHS=400
-CKPT_DIR="./checkpoints/checkpoints_variant_c_${TASK_NAME}_${TARGET_CAMERA}_vq${CODEBOOK_BINS}_dim${CODEBOOK_DIM}_future_sim_three_stage_horizon_focus_masked_region_lambda_vq_commit_0.25_kmeans"
+# RQ parameters: N=30 pooled tokens, D=128 codebook dim, M=4 stages, K=512 codes/stage
+RQ_TOKENS=30
+RQ_STAGES=4
+RQ_CODEBOOK_BINS=512
+CODEBOOK_DIM=128
+CKPT_DIR="./checkpoints/checkpoints_variant_c_${TASK_NAME}_${TARGET_CAMERA}_rq_N${RQ_TOKENS}_M${RQ_STAGES}_K${RQ_CODEBOOK_BINS}_D${CODEBOOK_DIM}_three_stage_resume"
+# Set to a *_training.ckpt path to resume; leave empty to start fresh
+RESUME_CKPT="checkpoints/checkpoints_variant_c_sim_transfer_cube_scripted_top_rq_N30_M4_K512_D128_three_stage/policy_stage1_act_last_training.ckpt"
 
 mkdir -p "${CKPT_DIR}"
 echo "Checkpoint dir: ${CKPT_DIR}"
 echo "Task: ${TASK_NAME}, target camera: ${TARGET_CAMERA}"
-echo "VQ: codebook_bins=${CODEBOOK_BINS}, codebook_dim=${CODEBOOK_DIM}, warmup_epochs=${VQ_WARMUP_EPOCHS}"
+echo "RQ: tokens=${RQ_TOKENS}, stages=${RQ_STAGES}, codebook_bins=${RQ_CODEBOOK_BINS}, codebook_dim=${CODEBOOK_DIM}"
 nvidia-smi
 
 python -u imitate_episodes_variant_c.py \
@@ -63,11 +67,16 @@ python -u imitate_episodes_variant_c.py \
     --future_teacher_mix_steps 8000 \
     --future_rgb_decay_alpha 0.03 \
     --future_latent_decay_alpha 0.01 \
-    --codebook_bins "${CODEBOOK_BINS}" \
     --codebook_dim "${CODEBOOK_DIM}" \
     --lambda_vq 1.0 \
     --lambda_vq_commit 0.25 \
-    --vq_warmup_epochs "${VQ_WARMUP_EPOCHS}" \
+    --vq_warmup_epochs 0 \
+    --rq_num_tokens "${RQ_TOKENS}" \
+    --rq_num_stages "${RQ_STAGES}" \
+    --rq_codebook_bins "${RQ_CODEBOOK_BINS}" \
+    --rq_dropout_probs 0.50 0.25 0.15 0.10 \
+    --rq_dead_code_restart_interval 1000 \
+    --rq_dead_code_restart_threshold 0.07 \
     --roi_background_weight 1.0 \
     --roi_detail_weight 10.0 \
     --comm_num_queries 8 \
@@ -79,3 +88,4 @@ python -u imitate_episodes_variant_c.py \
     --stage1_epochs 4000 \
     --stage2_epochs 4000 \
     --stage3_epochs 4000 \
+    ${RESUME_CKPT:+--resume_ckpt "${RESUME_CKPT}"} \
