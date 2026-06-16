@@ -61,6 +61,7 @@ class ACTPolicy(nn.Module):
         self.lambda_future_rgb = args_override.get("lambda_future_rgb", 1.0)
         self.lambda_future_grad = args_override.get("lambda_future_grad", 0.25)
         self.lambda_future_latent = args_override.get("lambda_future_latent", 0.1)
+        self.using_RQ = bool(args_override.get("using_RQ", False))
         self.lambda_vq = args_override.get("lambda_vq", 1.0)
         self.lambda_vq_commit = args_override.get("lambda_vq_commit", 0.25)
         self.vq_warmup_epochs = int(args_override.get("vq_warmup_epochs", 0))
@@ -87,7 +88,7 @@ class ACTPolicy(nn.Module):
             f"KL Weight {self.kl_weight}, lambda_roi {self.lambda_roi}, "
             f"lambda_sem {self.lambda_sem}, lambda_sig {self.lambda_sig}, "
             f"lambda_recon_grad {self.lambda_recon_grad}, "
-            f"focus_masked_region {self.focus_masked_region}, "
+            f"focus_masked_region {self.focus_masked_region}, using_RQ {self.using_RQ}, "
             f"lambda_vq {self.lambda_vq}, lambda_vq_commit {self.lambda_vq_commit}, "
             f"vq_warmup_epochs {self.vq_warmup_epochs}"
         )
@@ -165,7 +166,7 @@ class ACTPolicy(nn.Module):
         return self._ema_updates < int(warmup)
 
     def _use_quantized_memory(self):
-        return self.current_epoch >= self.vq_warmup_epochs
+        return self.using_RQ and self.current_epoch >= self.vq_warmup_epochs
 
     def _sample_rq_active_stages(self):
         """Sample how many RQ stages to use during training (biased toward more stages)."""
@@ -482,7 +483,7 @@ class ACTPolicy(nn.Module):
                     + loss_dict["future_grad"] * self.lambda_future_grad
                     + loss_dict["future_latent"] * self.lambda_future_latent
                 )
-            if self._use_quantized_memory() and not is_act_stage:
+            if use_rq:
                 loss_dict["loss"] = (
                     loss_dict["loss"]
                     + loss_dict["vq"] * self.lambda_vq
@@ -500,7 +501,7 @@ class ACTPolicy(nn.Module):
             qpos,
             image,
             env_state,
-            use_quantized_memory=True,
+            use_quantized_memory=self._use_quantized_memory(),
         )
         if return_comm:
             return a_hat, attn_weights, comm_outputs
@@ -517,7 +518,8 @@ class ACTPolicy(nn.Module):
 
     def should_restart_dead_codes(self):
         return (
-            self.train_stage in {"future", "joint"}
+            self.using_RQ
+            and self.train_stage in {"future", "joint"}
             and self.rq_dead_restart_interval > 0
             and self._rq_steps > 0
             and self._rq_steps % self.rq_dead_restart_interval == 0

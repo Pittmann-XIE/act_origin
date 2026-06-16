@@ -197,6 +197,7 @@ def main(args):
             "future_rgb_decay_alpha": args["future_rgb_decay_alpha"],
             "future_latent_decay_alpha": args["future_latent_decay_alpha"],
             "future_teacher_mix_steps": args["future_teacher_mix_steps"],
+            "using_RQ": args["using_RQ"],
             "codebook_bins": args["codebook_bins"],
             "codebook_dim": args["codebook_dim"],
             "lambda_vq": args["lambda_vq"],
@@ -402,6 +403,7 @@ def load_eval_config_from_training_snapshot(config, args):
         "rq_dead_code_restart_max_fraction",
         args.get("rq_dead_code_restart_max_fraction", 0.05),
     )
+    policy_config["using_RQ"] = args["using_RQ"]
 
     print(f"Loaded eval model config from {config_path}")
     return eval_config
@@ -1545,6 +1547,9 @@ def init_codebook_kmeans(policy, train_dataloader, device, n_batches=200, n_iter
     per-stage codebook weights. Only runs if the policy model exposes a
     `memory_quantizer` attribute.
     """
+    if not getattr(policy, "using_RQ", False):
+        print("Skipping RQ cascaded k-means init because using_RQ is disabled.")
+        return
     if not hasattr(policy.model, "memory_quantizer"):
         return
     rq = policy.model.memory_quantizer
@@ -1637,6 +1642,8 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_future_rgb", action="store", type=float, default=1.0)
     parser.add_argument("--lambda_future_grad", action="store", type=float, default=0.25)
     parser.add_argument("--lambda_future_latent", action="store", type=float, default=0.1)
+    parser.add_argument("--using_RQ", action="store_true",
+                        help="Enable residual quantization and its VQ losses. Disabled by default.")
     parser.add_argument("--codebook_bins", action="store", type=int, default=512)
     parser.add_argument("--codebook_dim", action="store", type=int, default=128)
     parser.add_argument("--lambda_vq", action="store", type=float, default=1.0)

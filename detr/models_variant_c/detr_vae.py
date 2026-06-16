@@ -595,7 +595,8 @@ class DETRVAE(nn.Module):
         memory = self.transformer.encoder(src_full, src_key_padding_mask=None, pos=pos_full)
 
         # When quantized: both action decoder and future/comm branch use the shared quantized
-        # payload P.  When not quantized (stage1): action decoder uses full unquantized memory.
+        # payload P. When not quantized, action decoding keeps full encoder memory while
+        # future/comm use the same 32-token pooled payload without RQ.
         if use_quantized_memory:
             rq_memory, vq_outputs = self._quantize_memory(
                 memory, feat_h, feat_w, num_active_stages=num_active_rq_stages
@@ -603,7 +604,9 @@ class DETRVAE(nn.Module):
             rq_pos = self._rq_pos_for_decode(rq_memory.shape[0], bs, memory.device)
             hs, attn_weights = self._decode_from_memory(rq_memory, pos=rq_pos)
         else:
-            rq_memory = None
+            rq_memory = self._pool_visual_tokens(memory, feat_h, feat_w)
+            pos_idx = torch.arange(rq_memory.shape[0], device=memory.device)
+            rq_memory = rq_memory + self.rq_pos_embed(pos_idx).unsqueeze(1)
             vq_outputs = self._empty_vq_outputs(memory)
             hs, attn_weights = self._decode_from_memory(memory, pos=pos_full)
 
