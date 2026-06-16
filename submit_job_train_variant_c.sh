@@ -30,9 +30,9 @@ RQ_TOKENS=30
 RQ_STAGES=4
 RQ_CODEBOOK_BINS=512
 CODEBOOK_DIM=128
-CKPT_DIR="./checkpoints/checkpoints_variant_c_${TASK_NAME}_${TARGET_CAMERA}_rq_N${RQ_TOKENS}_M${RQ_STAGES}_K${RQ_CODEBOOK_BINS}_D${CODEBOOK_DIM}_three_stage_resume"
+CKPT_DIR="./checkpoints/checkpoints_variant_c_${TASK_NAME}_${TARGET_CAMERA}_rq_N${RQ_TOKENS}_M${RQ_STAGES}_K${RQ_CODEBOOK_BINS}_D${CODEBOOK_DIM}_2_three_stage"
 # Set to a *_training.ckpt path to resume; leave empty to start fresh
-RESUME_CKPT="checkpoints/checkpoints_variant_c_sim_transfer_cube_scripted_top_rq_N30_M4_K512_D128_three_stage/policy_stage1_act_last_training.ckpt"
+RESUME_CKPT=""
 
 mkdir -p "${CKPT_DIR}"
 echo "Checkpoint dir: ${CKPT_DIR}"
@@ -77,6 +77,7 @@ python -u imitate_episodes_variant_c.py \
     --rq_dropout_probs 0.50 0.25 0.15 0.10 \
     --rq_dead_code_restart_interval 1000 \
     --rq_dead_code_restart_threshold 0.07 \
+    --rq_dead_code_restart_max_fraction 0.05 \
     --roi_background_weight 1.0 \
     --roi_detail_weight 10.0 \
     --comm_num_queries 8 \
@@ -88,4 +89,4 @@ python -u imitate_episodes_variant_c.py \
     --stage1_epochs 4000 \
     --stage2_epochs 4000 \
     --stage3_epochs 4000 \
-    ${RESUME_CKPT:+--resume_ckpt "${RESUME_CKPT}"} \
+    ${RESUME_CKPT:+--resume_ckpt "${RESUME_CKPT}"}

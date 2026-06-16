@@ -73,12 +73,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from einops import rearrange
 from tqdm import tqdm
 
 from constants import DT, PUPPET_GRIPPER_JOINT_OPEN
 from policy_variant_c import ACTPolicy, CNNMLPPolicy
 from utils_variant_b import (
+    build_detail_weight_mask,
+    build_focus_region_weight_mask,
     compute_dict_mean,
     load_data,
     sample_box_pose,
@@ -178,6 +181,8 @@ def main(args):
             "lambda_sig": args["lambda_sig"],
             "lambda_recon_grad": args["lambda_recon_grad"],
             "focus_masked_region": args["focus_masked_region"],
+            "roi_background_weight": args["roi_background_weight"],
+            "roi_detail_weight": args["roi_detail_weight"],
             "comm_num_queries": args["comm_num_queries"],
             "comm_layers": args["comm_layers"],
             "comm_detach_warmup": args["comm_detach_warmup"],
@@ -203,6 +208,7 @@ def main(args):
             "rq_dropout_probs": args["rq_dropout_probs"],
             "rq_dead_code_restart_interval": args["rq_dead_code_restart_interval"],
             "rq_dead_code_restart_threshold": args["rq_dead_code_restart_threshold"],
+            "rq_dead_code_restart_max_fraction": args["rq_dead_code_restart_max_fraction"],
         }
     elif policy_class == "CNNMLP":
         policy_config = {
@@ -244,6 +250,7 @@ def main(args):
         return
 
     if is_eval:
+        config = load_eval_config_from_training_snapshot(config, args)
         results = []
         for ckpt_name in ["policy_best.ckpt"]:
             success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
@@ -365,6 +372,39 @@ def save_training_config_snapshot(ckpt_dir, args, config, resolved_context):
         file_obj.write("\n")
 
     print(f"Saved training config snapshot to {config_path}")
+
+
+def load_eval_config_from_training_snapshot(config, args):
+    """Use saved training config for eval-time model reconstruction when available."""
+    ckpt_dir = config["ckpt_dir"]
+    config_path = os.path.join(ckpt_dir, "training_config.json")
+    if not os.path.exists(config_path):
+        print(f"Eval config snapshot not found at {config_path}; using command-line config.")
+        return config
+
+    with open(config_path, "r", encoding="utf-8") as file_obj:
+        snapshot = json.load(file_obj)
+    saved_config = snapshot.get("training_config")
+    if not isinstance(saved_config, dict):
+        raise ValueError(f"Invalid training config snapshot: missing 'training_config' object in {config_path}")
+
+    eval_config = deepcopy(saved_config)
+    eval_config["ckpt_dir"] = ckpt_dir
+    eval_config["device"] = args["device"]
+    eval_config["onscreen_render"] = args["onscreen_render"]
+    eval_config["temporal_agg"] = args["temporal_agg"]
+    eval_config["resume_ckpt"] = args.get("resume_ckpt")
+
+    policy_config = eval_config.get("policy_config")
+    if not isinstance(policy_config, dict):
+        raise ValueError(f"Invalid training config snapshot: missing 'policy_config' object in {config_path}")
+    policy_config.setdefault(
+        "rq_dead_code_restart_max_fraction",
+        args.get("rq_dead_code_restart_max_fraction", 0.05),
+    )
+
+    print(f"Loaded eval model config from {config_path}")
+    return eval_config
 
 
 def load_policy_checkpoint(policy, ckpt_path, device, description):
@@ -581,6 +621,46 @@ def tensor_to_uint8_frames(frame_tensor):
     return (frames * 255.0).astype(np.uint8)
 
 
+TARGET_MASK_GEOMS = {
+    "red_box": 1,
+    "vx300s_left/10_left_gripper_finger": 2,
+    "vx300s_left/10_right_gripper_finger": 2,
+    "vx300s_right/10_left_gripper_finger": 3,
+    "vx300s_right/10_right_gripper_finger": 3,
+}
+
+
+def get_physics(env):
+    return getattr(env, "physics", getattr(env, "_physics", None))
+
+
+def get_target_geom_classes(physics):
+    geom_classes = {}
+    for geom_name, class_id in TARGET_MASK_GEOMS.items():
+        geom_id = physics.model.name2id(geom_name, "geom")
+        geom_classes[geom_id] = class_id
+    return geom_classes
+
+
+def render_target_mask(physics, camera_name, geom_classes, height=480, width=640):
+    import mujoco
+
+    segmentation = physics.render(
+        height=height,
+        width=width,
+        camera_id=camera_name,
+        segmentation=True,
+    )
+    geom_ids = segmentation[:, :, 0]
+    obj_types = segmentation[:, :, 1]
+    is_geom = obj_types == int(mujoco.mjtObj.mjOBJ_GEOM)
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for geom_id, class_id in geom_classes.items():
+        mask[is_geom & (geom_ids == geom_id)] = class_id
+    return mask
+
+
 def add_panel_label(image, text):
     labeled = image.copy()
     cv2.putText(
@@ -626,6 +706,138 @@ def save_eval_video(frames, dt, video_path):
         out.write(frame[:, :, [2, 1, 0]])
     out.release()
     print(f"Saved eval video to: {video_path}")
+
+
+def resize_rgb_for_future(rgb, height, width):
+    if rgb.shape[0] != height or rgb.shape[1] != width:
+        rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA)
+    return rgb
+
+
+def resize_mask_for_future(mask, height, width):
+    if mask.shape[0] != height or mask.shape[1] != width:
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+    return mask
+
+
+def future_eval_sample_metrics(
+    policy,
+    pred_future,
+    pred_future_z,
+    target_views,
+    target_masks,
+    start_t,
+    future_horizons,
+    future_image_height,
+    future_image_width,
+    roi_background_weight,
+    roi_detail_weight,
+    device,
+):
+    gt_frames = []
+    valid = []
+    roi_weight_masks = []
+    focus_weight_masks = []
+    red_cube_masks = []
+    for horizon in future_horizons:
+        target_t = start_t + int(horizon)
+        is_valid = target_t < len(target_views)
+        read_t = min(target_t, len(target_views) - 1)
+        gt_rgb = resize_rgb_for_future(target_views[read_t], future_image_height, future_image_width)
+        gt_mask = resize_mask_for_future(target_masks[read_t], future_image_height, future_image_width)
+        gt_frames.append(gt_rgb)
+        valid.append(is_valid)
+        roi_weight_masks.append(
+            build_detail_weight_mask(
+                gt_rgb,
+                background_weight=roi_background_weight,
+                detail_weight=roi_detail_weight,
+            )
+        )
+        focus_weight_masks.append(build_focus_region_weight_mask(gt_mask))
+        red_cube_masks.append(gt_mask == 1)
+
+    pred = torch.from_numpy(pred_future).permute(0, 3, 1, 2).float().to(device) / 255.0
+    target = torch.from_numpy(np.stack(gt_frames, axis=0)).permute(0, 3, 1, 2).float().to(device) / 255.0
+    valid_tensor = torch.tensor(valid, dtype=torch.bool, device=device).unsqueeze(0)
+    roi_weight = torch.from_numpy(np.stack(roi_weight_masks, axis=0)).float().to(device).unsqueeze(0)
+
+    pred = pred.unsqueeze(0)
+    target = target.unsqueeze(0)
+    metrics = {
+        "eval_future_rgb": ACTPolicy._decayed_l1(
+            pred,
+            target,
+            valid_tensor,
+            future_horizons,
+            policy.future_rgb_decay_alpha,
+            roi_weight,
+        ),
+        "eval_future_grad": ACTPolicy._decayed_gradient_l1(
+            pred,
+            target,
+            valid_tensor,
+            future_horizons,
+            policy.future_rgb_decay_alpha,
+            roi_weight,
+        ),
+        "eval_future_roi_fg": (
+            roi_weight > roi_weight.amin(dim=(-2, -1), keepdim=True)
+        ).float().mean(),
+        "eval_future_focus_fg": torch.from_numpy(
+            (np.stack(focus_weight_masks, axis=0) > 0).astype(np.float32)
+        ).to(device).mean(),
+    }
+    if pred_future_z is not None:
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=target.dtype, device=device).view(1, 1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=target.dtype, device=device).view(1, 1, 3, 1, 1)
+        with torch.inference_mode():
+            target_z = policy.model._encode_ema_future_targets((target - mean) / std)
+        pred_z = pred_future_z.to(device)
+        metrics["eval_future_latent"] = ACTPolicy._decayed_latent_mse(
+            pred_z,
+            target_z,
+            valid_tensor,
+            future_horizons,
+            policy.future_latent_decay_alpha,
+        )
+    else:
+        metrics["eval_future_latent"] = torch.zeros((), device=device)
+    for horizon_idx, horizon in enumerate(future_horizons):
+        key = f"eval_future_rgb_h{horizon}"
+        grad_key = f"eval_future_grad_h{horizon}"
+        cube_key = f"eval_future_red_cube_l1_h{horizon}"
+        if valid[horizon_idx]:
+            pred_i = pred[:, horizon_idx]
+            target_i = target[:, horizon_idx]
+            metrics[key] = F.l1_loss(pred_i, target_i)
+            pred_dx = pred_i[:, :, :, 1:] - pred_i[:, :, :, :-1]
+            target_dx = target_i[:, :, :, 1:] - target_i[:, :, :, :-1]
+            pred_dy = pred_i[:, :, 1:, :] - pred_i[:, :, :-1, :]
+            target_dy = target_i[:, :, 1:, :] - target_i[:, :, :-1, :]
+            metrics[grad_key] = F.l1_loss(pred_dx, target_dx) + F.l1_loss(pred_dy, target_dy)
+            red_cube_mask = torch.from_numpy(red_cube_masks[horizon_idx]).bool().to(device)
+            if red_cube_mask.any():
+                cube_weight = red_cube_mask[None, None].expand_as(pred_i)
+                metrics[cube_key] = F.l1_loss(pred_i[cube_weight], target_i[cube_weight])
+            else:
+                metrics[cube_key] = torch.zeros((), device=device)
+        else:
+            metrics[key] = torch.zeros((), device=device)
+            metrics[grad_key] = torch.zeros((), device=device)
+            metrics[cube_key] = torch.zeros((), device=device)
+    metrics["eval_future_loss"] = (
+        metrics["eval_future_rgb"] * policy.lambda_future_rgb
+        + metrics["eval_future_grad"] * policy.lambda_future_grad
+        + metrics["eval_future_latent"] * policy.lambda_future_latent
+    )
+    return metrics
+
+
+def summarize_metric_sums(metric_sums, metric_count):
+    if metric_count == 0:
+        return {}
+    return {key: value / metric_count for key, value in sorted(metric_sums.items())}
 
 
 def sample_non_colliding_pose(existing_poses, min_dist=0.06, max_tries=100):
@@ -684,6 +896,10 @@ def eval_bc(config, ckpt_name, save_episode=True):
     env_max_reward = env.task.max_reward
     if "sim_transfer_cube" not in task_name:
         raise NotImplementedError("Variant C future visualization currently supports sim_transfer_cube only.")
+    physics = get_physics(env)
+    if physics is None:
+        raise RuntimeError("Could not find MuJoCo physics object on evaluation environment.")
+    target_geom_classes = get_target_geom_classes(physics)
 
     query_frequency = policy_config["num_queries"]
     if temporal_agg:
@@ -693,6 +909,12 @@ def eval_bc(config, ckpt_name, save_episode=True):
     num_rollouts = 50
     episode_returns = []
     highest_rewards = []
+    eval_metric_sums = {}
+    eval_metric_count = 0
+    future_image_height = int(policy_config.get("future_image_height", 240))
+    future_image_width = int(policy_config.get("future_image_width", 320))
+    roi_background_weight = float(policy_config.get("roi_background_weight", 1.0))
+    roi_detail_weight = float(policy_config.get("roi_detail_weight", 10.0))
     for rollout_id in range(num_rollouts):
         rollout_id += 1
         if "sim_transfer_cube" in task_name:
@@ -715,11 +937,14 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
         robot_views = []
         target_views = []
+        target_masks = []
         pred_future_by_t = []
+        pred_future_z_by_t = []
         qpos_list = []
         target_qpos_list = []
         rewards = []
         pred_future = None
+        pred_future_z = None
         with torch.inference_mode():
             for t in range(max_timesteps):
                 if onscreen_render:
@@ -732,6 +957,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 qpos = torch.from_numpy(pre_process(qpos_numpy)).float().to(device_obj).unsqueeze(0)
                 curr_image = get_image(ts, camera_names, device_obj)
                 obs_target_rgb = obs["images"][target_camera]
+                obs_target_mask = render_target_mask(
+                    physics,
+                    target_camera,
+                    target_geom_classes,
+                    height=obs_target_rgb.shape[0],
+                    width=obs_target_rgb.shape[1],
+                )
 
                 if config["policy_class"] == "ACT":
                     if t % query_frequency == 0:
@@ -739,8 +971,14 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         future_rgb_hat = comm_outputs.get("future_rgb_hat")
                         if future_rgb_hat is not None:
                             pred_future = tensor_to_uint8_frames(future_rgb_hat)
+                            pred_future_z = comm_outputs.get("future_z_hat")
+                            if pred_future_z is not None:
+                                pred_future_z = pred_future_z.detach().cpu()
+                            else:
+                                pred_future_z = None
                         else:
                             pred_future = None
+                            pred_future_z = None
                     if temporal_agg:
                         all_time_actions[[t], t : t + num_queries] = all_actions
                         actions_for_curr_step = all_time_actions[:, t]
@@ -766,23 +1004,28 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 rewards.append(ts.reward)
                 robot_views.append(obs["images"][onscreen_cam])
                 target_views.append(obs_target_rgb)
+                target_masks.append(obs_target_mask)
                 if pred_future is None:
                     pred_future_by_t.append(
                         np.zeros(
                             (
                                 len(future_horizons),
-                                policy_config.get("future_image_height", 240),
-                                policy_config.get("future_image_width", 320),
+                                future_image_height,
+                                future_image_width,
                                 3,
                             ),
                             dtype=np.uint8,
                         )
                     )
+                    pred_future_z_by_t.append(None)
                 else:
                     pred_future_by_t.append(pred_future)
+                    pred_future_z_by_t.append(pred_future_z)
 
             plt.close()
         eval_frames = []
+        rollout_metric_sums = {}
+        rollout_metric_count = 0
         if save_episode:
             for t, pred_future_t in enumerate(pred_future_by_t):
                 gt_future = []
@@ -790,6 +1033,28 @@ def eval_bc(config, ckpt_name, save_episode=True):
                     gt_idx = min(t + int(horizon), len(target_views) - 1)
                     gt_future.append(target_views[gt_idx])
                 eval_frames.append(build_eval_frame(robot_views[t], pred_future_t, gt_future, future_horizons))
+        for t, (pred_future_t, pred_future_z_t) in enumerate(zip(pred_future_by_t, pred_future_z_by_t)):
+            metrics = future_eval_sample_metrics(
+                policy,
+                pred_future_t,
+                pred_future_z_t,
+                target_views,
+                target_masks,
+                t,
+                future_horizons,
+                future_image_height,
+                future_image_width,
+                roi_background_weight,
+                roi_detail_weight,
+                device_obj,
+            )
+            scalar_metrics = scalarize_dict(metrics)
+            for key, value in scalar_metrics.items():
+                rollout_metric_sums[key] = rollout_metric_sums.get(key, 0.0) + float(value)
+                eval_metric_sums[key] = eval_metric_sums.get(key, 0.0) + float(value)
+            rollout_metric_count += 1
+            eval_metric_count += 1
+        rollout_metrics = summarize_metric_sums(rollout_metric_sums, rollout_metric_count)
         rewards = np.array(rewards)
         episode_return = np.sum(rewards[rewards != None])
         episode_returns.append(episode_return)
@@ -799,17 +1064,37 @@ def eval_bc(config, ckpt_name, save_episode=True):
             f"Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, "
             f"{env_max_reward=}, Success: {episode_highest_reward == env_max_reward}"
         )
+        if rollout_metrics:
+            print(
+                "Image prediction: "
+                f"future_loss={rollout_metrics.get('eval_future_loss', 0.0):.6f}, "
+                f"future_rgb={rollout_metrics.get('eval_future_rgb', 0.0):.6f}, "
+                f"future_grad={rollout_metrics.get('eval_future_grad', 0.0):.6f}, "
+                f"red_cube_h0={rollout_metrics.get('eval_future_red_cube_l1_h0', 0.0):.6f}"
+            )
 
         if save_episode:
             save_eval_video(eval_frames, DT, video_path=os.path.join(ckpt_dir, f"video{rollout_id}.mp4"))
 
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
+    eval_metrics = summarize_metric_sums(eval_metric_sums, eval_metric_count)
     summary_str = f"\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n"
     for reward in range(env_max_reward + 1):
         more_or_equal_r = (np.array(highest_rewards) >= reward).sum()
         more_or_equal_r_rate = more_or_equal_r / num_rollouts
         summary_str += f"Reward >= {reward}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n"
+    if eval_metrics:
+        summary_str += "\nImage prediction metrics:\n"
+        summary_str += (
+            "eval_future_loss: "
+            f"{eval_metrics.get('eval_future_loss', 0.0)} "
+            "(lambda_future_rgb * eval_future_rgb + lambda_future_grad * eval_future_grad "
+            "+ lambda_future_latent * eval_future_latent)\n"
+        )
+        for key, value in eval_metrics.items():
+            if key != "eval_future_loss":
+                summary_str += f"{key}: {value}\n"
 
     print(summary_str)
     result_file_name = "result_" + ckpt_name.split(".")[0] + ".txt"
@@ -1364,6 +1649,7 @@ if __name__ == "__main__":
                         default=[0.50, 0.25, 0.15, 0.10])
     parser.add_argument("--rq_dead_code_restart_interval", action="store", type=int, default=500)
     parser.add_argument("--rq_dead_code_restart_threshold", action="store", type=float, default=0.07)
+    parser.add_argument("--rq_dead_code_restart_max_fraction", action="store", type=float, default=0.05)
     parser.add_argument("--resume_ckpt", action="store", type=str, default=None)
     parser.add_argument("--grad_accum_steps", action="store", type=int, default=1)
     parser.add_argument("--export_netron_onnx", action="store", type=str, default=None)

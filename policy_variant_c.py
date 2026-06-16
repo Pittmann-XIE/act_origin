@@ -68,7 +68,10 @@ class ACTPolicy(nn.Module):
         self.rq_dropout_probs = list(args_override.get("rq_dropout_probs", [0.50, 0.25, 0.15, 0.10]))
         self.rq_dead_restart_interval = int(args_override.get("rq_dead_code_restart_interval", 500))
         self.rq_dead_restart_threshold = float(args_override.get("rq_dead_code_restart_threshold", 0.07))
+        self.rq_dead_restart_max_fraction = float(args_override.get("rq_dead_code_restart_max_fraction", 0.05))
         self._rq_steps = 0
+        self._rq_usage_counts = None
+        self._rq_usage_totals = None
         self.future_rgb_decay_alpha = args_override.get("future_rgb_decay_alpha", 0.03)
         self.future_latent_decay_alpha = args_override.get("future_latent_decay_alpha", 0.01)
         self.future_teacher_mix_steps = max(1, int(args_override.get("future_teacher_mix_steps", 10000)))
@@ -175,6 +178,46 @@ class ACTPolicy(nn.Module):
             if r < cumulative:
                 return i + 1
         return len(self.rq_dropout_probs)
+
+    def _ensure_rq_usage_buffers(self, device):
+        device = torch.device(device)
+        rq = self.model.memory_quantizer
+        needs_init = (
+            self._rq_usage_counts is None
+            or len(self._rq_usage_counts) != rq.num_stages
+            or self._rq_usage_counts[0].numel() != rq.codebook_bins
+            or self._rq_usage_counts[0].device != device
+        )
+        if needs_init:
+            self._rq_usage_counts = [
+                torch.zeros(rq.codebook_bins, dtype=torch.float32, device=device)
+                for _ in range(rq.num_stages)
+            ]
+            self._rq_usage_totals = [
+                torch.zeros((), dtype=torch.float32, device=device)
+                for _ in range(rq.num_stages)
+            ]
+
+    @torch.no_grad()
+    def _accumulate_rq_usage(self, codes, num_active_stages):
+        if codes is None or num_active_stages is None:
+            return
+        rq = self.model.memory_quantizer
+        self._ensure_rq_usage_buffers(codes.device)
+        active = min(int(num_active_stages), rq.num_stages)
+        for stage_idx in range(active):
+            stage_codes = codes[..., stage_idx].reshape(-1)
+            counts = torch.bincount(stage_codes, minlength=rq.codebook_bins).to(torch.float32)
+            self._rq_usage_counts[stage_idx].add_(counts)
+            self._rq_usage_totals[stage_idx].add_(float(stage_codes.numel()))
+
+    def _reset_rq_usage_buffers(self):
+        if self._rq_usage_counts is None or self._rq_usage_totals is None:
+            return
+        for counts in self._rq_usage_counts:
+            counts.zero_()
+        for total in self._rq_usage_totals:
+            total.zero_()
 
     def _sig_reg(self, z_comm_pool):
         if z_comm_pool is None or z_comm_pool.shape[0] <= 1:
@@ -399,6 +442,8 @@ class ACTPolicy(nn.Module):
             loss_dict["vq"] = comm_outputs["vq_loss"]
             loss_dict["vq_commit"] = comm_outputs["vq_commitment_loss"]
             loss_dict["vq_perplexity"] = comm_outputs["vq_perplexity"]
+            if self.training and use_rq:
+                self._accumulate_rq_usage(comm_outputs.get("vq_codes"), num_active_rq_stages)
             loss_dict["rq_active_stages"] = torch.tensor(
                 float(num_active_rq_stages if num_active_rq_stages is not None else
                       self.model.memory_quantizer.num_stages),
@@ -473,14 +518,16 @@ class ACTPolicy(nn.Module):
     def should_restart_dead_codes(self):
         return (
             self.train_stage in {"future", "joint"}
+            and self.rq_dead_restart_interval > 0
             and self._rq_steps > 0
             and self._rq_steps % self.rq_dead_restart_interval == 0
         )
 
     @torch.no_grad()
     def maybe_restart_dead_codes(self, image_data, qpos_data, device):
-        """Reinitialize dead codebook entries from current batch vectors."""
+        """Reinitialize codes with low usage over the accumulated RQ window."""
         rq = self.model.memory_quantizer
+        self._ensure_rq_usage_buffers(device)
         was_training = self.training
         self.eval()
 
@@ -500,24 +547,48 @@ class ACTPolicy(nn.Module):
                 dists = v.pow(2).sum(1, keepdim=True) - 2.0 * (v @ stage.embedding.weight.t()) + c_sq
                 assignments[start : start + chunk] = dists.argmin(dim=1)
 
-            counts = torch.zeros(stage.codebook_bins, device=device)
-            counts.scatter_add_(0, assignments, torch.ones(flat.shape[0], device=device))
-            expected = flat.shape[0] / stage.codebook_bins
-            dead_mask = counts < self.rq_dead_restart_threshold * expected
-            n_dead = int(dead_mask.sum())
-            if n_dead > 0:
-                rand_idx = torch.randint(0, flat.shape[0], (n_dead,), device=device)
-                stage.embedding.weight.data[dead_mask] = flat[rand_idx]
-                print(f"  RQ stage {i + 1}: restarted {n_dead}/{stage.codebook_bins} dead codes "
-                      f"(active: {stage.codebook_bins - n_dead})")
+            window_counts = self._rq_usage_counts[i]
+            window_total = float(self._rq_usage_totals[i].item())
+            if window_total <= 0:
+                active = int((window_counts > 0).sum())
+                print(f"  RQ stage {i + 1}: skipped dead-code restart; no accumulated assignments "
+                      f"(active_window: {active}/{stage.codebook_bins})")
             else:
-                active = int((counts > 0).sum())
-                print(f"  RQ stage {i + 1}: all codes active ({active}/{stage.codebook_bins})")
+                expected = window_total / stage.codebook_bins
+                dead_threshold = self.rq_dead_restart_threshold * expected
+                dead_indices = torch.nonzero(window_counts < dead_threshold, as_tuple=False).flatten()
+                n_dead = int(dead_indices.numel())
+                max_fraction = self.rq_dead_restart_max_fraction
+                if max_fraction <= 0:
+                    max_restart = 0
+                elif max_fraction >= 1:
+                    max_restart = stage.codebook_bins
+                else:
+                    max_restart = max(1, int(stage.codebook_bins * max_fraction))
+                n_restart = min(n_dead, max_restart)
+
+                if n_restart > 0:
+                    if n_dead > n_restart:
+                        candidate_counts = window_counts[dead_indices]
+                        selected = torch.topk(candidate_counts, k=n_restart, largest=False).indices
+                        restart_indices = dead_indices[selected]
+                    else:
+                        restart_indices = dead_indices
+                    rand_idx = torch.randint(0, flat.shape[0], (n_restart,), device=device)
+                    stage.embedding.weight.data[restart_indices] = flat[rand_idx]
+                active = int((window_counts > 0).sum())
+                print(
+                    f"  RQ stage {i + 1}: window_assignments={int(window_total)} "
+                    f"expected={expected:.2f} threshold={dead_threshold:.2f} "
+                    f"dead={n_dead}/{stage.codebook_bins} restarted={n_restart} "
+                    f"active_window={active}/{stage.codebook_bins}"
+                )
 
             # Advance residual for next stage
             quantized = stage.embedding(assignments)
             residual = flat - quantized
 
+        self._reset_rq_usage_buffers()
         if was_training:
             self.train()
 
