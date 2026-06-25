@@ -3,6 +3,8 @@
 Variant C ACT model with RQ-compressed encoder memory.
 """
 import copy
+from contextlib import contextmanager
+import time
 
 import numpy as np
 import torch
@@ -231,6 +233,7 @@ class ResidualQuantizer(nn.Module):
     def __init__(self, num_stages, codebook_bins, codebook_dim):
         super().__init__()
         self.num_stages = num_stages
+        self.num_codebooks = num_stages
         self.codebook_bins = int(codebook_bins)
         self.codebook_dim = int(codebook_dim)
         self.stages = nn.ModuleList(
@@ -311,6 +314,77 @@ class ResidualQuantizer(nn.Module):
                 residual = flat - quantized
 
 
+class SplitVectorQuantizer(nn.Module):
+    """Product-style VQ: split the code vector and quantize each chunk with its own codebook."""
+
+    def __init__(self, num_codebooks, codebook_bins, codebook_dim):
+        super().__init__()
+        self.num_codebooks = int(num_codebooks)
+        self.num_stages = self.num_codebooks
+        self.codebook_bins = int(codebook_bins)
+        self.codebook_dim = int(codebook_dim)
+        if self.num_codebooks <= 0:
+            raise ValueError(f"split_vq_num_codebooks must be positive, got {self.num_codebooks}")
+        if self.codebook_dim % self.num_codebooks != 0:
+            raise ValueError(
+                f"codebook_dim={self.codebook_dim} must be divisible by "
+                f"split_vq_num_codebooks={self.num_codebooks}"
+            )
+        self.chunk_dim = self.codebook_dim // self.num_codebooks
+        self.codebooks = nn.ModuleList(
+            [VectorQuantizer(self.codebook_bins, self.chunk_dim) for _ in range(self.num_codebooks)]
+        )
+
+    def forward(self, x, num_active_stages=None):
+        del num_active_stages
+        original_shape = x.shape
+        flat_x = x.reshape(-1, self.codebook_dim)
+        chunks = flat_x.reshape(-1, self.num_codebooks, self.chunk_dim)
+        quantized_chunks = []
+        all_codes = []
+        per_codebook_perplexities = []
+        total_codebook_loss = torch.zeros((), device=x.device, dtype=x.dtype)
+        total_commitment_loss = torch.zeros((), device=x.device, dtype=x.dtype)
+
+        for i, codebook in enumerate(self.codebooks):
+            result = codebook(chunks[:, i, :])
+            quantized_chunks.append(result["quantized"])
+            all_codes.append(result["codes"])
+            per_codebook_perplexities.append(result["perplexity"])
+            total_codebook_loss = total_codebook_loss + result["codebook_loss"]
+            total_commitment_loss = total_commitment_loss + result["commitment_loss"]
+
+        quantized = torch.cat(quantized_chunks, dim=-1).reshape(original_shape)
+        codes = torch.stack(all_codes, dim=-1).reshape(original_shape[:-1] + (self.num_codebooks,))
+        return {
+            "quantized": quantized,
+            "codes": codes,
+            "codebook_loss": total_codebook_loss / self.num_codebooks,
+            "commitment_loss": total_commitment_loss / self.num_codebooks,
+            "perplexity": torch.stack(per_codebook_perplexities).mean(),
+            "stage_perplexities": per_codebook_perplexities,
+        }
+
+    def decode(self, codes):
+        """Decode Split-VQ codes to vectors. codes: (..., num_codebooks) -> (..., codebook_dim)."""
+        decoded_chunks = [
+            codebook.decode(codes[..., i])
+            for i, codebook in enumerate(self.codebooks)
+        ]
+        return torch.cat(decoded_chunks, dim=-1)
+
+    def init_from_data(self, vectors, n_iter=50):
+        """Initialize each split codebook with k-means on its corresponding chunk."""
+        flat = vectors.reshape(-1, self.codebook_dim)
+        chunks = flat.reshape(-1, self.num_codebooks, self.chunk_dim)
+        for i, codebook in enumerate(self.codebooks):
+            print(
+                f"  Split-VQ codebook {i + 1}/{self.num_codebooks}: "
+                f"k-means init on dim {self.chunk_dim} chunk..."
+            )
+            codebook.init_from_data(chunks[:, i, :], n_iter=n_iter)
+
+
 class DETRVAE(nn.Module):
     def __init__(
         self,
@@ -332,6 +406,9 @@ class DETRVAE(nn.Module):
         rq_num_tokens=30,
         rq_num_stages=4,
         rq_codebook_bins=512,
+        quantizer_type="rq",
+        split_vq_num_codebooks=8,
+        split_vq_codebook_bins=512,
     ):
         super().__init__()
         self.num_queries = num_queries
@@ -347,6 +424,9 @@ class DETRVAE(nn.Module):
         self.hidden_dim = transformer.d_model
         self.codebook_bins = int(codebook_bins)
         self.codebook_dim = self.hidden_dim if codebook_dim is None else int(codebook_dim)
+        self.quantizer_type = quantizer_type
+        if self.quantizer_type not in {"none", "rq", "split_vq"}:
+            raise ValueError(f"Unknown quantizer_type {self.quantizer_type!r}; expected none, rq, or split_vq.")
         self.rq_num_tokens = int(rq_num_tokens)
         self.action_head = nn.Linear(self.hidden_dim, state_dim)
         self.is_pad_head = nn.Linear(self.hidden_dim, 1)
@@ -374,7 +454,7 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, self.hidden_dim)
         self.additional_pos_embed = nn.Embedding(2, self.hidden_dim)
 
-        # RQ modules: positional encoding for the 2+rq_num_tokens pooled tokens
+        # Quantizer modules: positional encoding for the 2+rq_num_tokens pooled tokens
         self.rq_pos_embed = nn.Embedding(2 + self.rq_num_tokens, self.hidden_dim)
         # Projection in: hidden_dim → codebook_dim (MLP + LayerNorm for stable quantizer input)
         self.memory_to_code = nn.Sequential(
@@ -385,7 +465,12 @@ class DETRVAE(nn.Module):
         )
         # Projection out: codebook_dim → hidden_dim
         self.code_to_memory = nn.Linear(self.codebook_dim, self.hidden_dim)
-        self.memory_quantizer = ResidualQuantizer(rq_num_stages, rq_codebook_bins, self.codebook_dim)
+        if self.quantizer_type == "split_vq":
+            self.memory_quantizer = SplitVectorQuantizer(
+                split_vq_num_codebooks, split_vq_codebook_bins, self.codebook_dim
+            )
+        else:
+            self.memory_quantizer = ResidualQuantizer(rq_num_stages, rq_codebook_bins, self.codebook_dim)
 
         self.comm_query_embed = nn.Embedding(comm_num_queries, self.hidden_dim)
         self.comm_task_token = nn.Embedding(1, self.hidden_dim)
@@ -448,6 +533,46 @@ class DETRVAE(nn.Module):
         self.ema_visual_fusion = copy.deepcopy(self.visual_fusion)
         self.ema_projector = copy.deepcopy(self.comm_pool_proj)
         self._freeze_ema()
+        self._inference_profile = None
+        self._profile_current_stage = None
+
+    @contextmanager
+    def _profile_section(self, name, device):
+        if self._inference_profile is None:
+            yield
+            return
+        device = torch.device(device)
+        use_cuda_timer = torch.cuda.is_available() and device.type == "cuda"
+        previous_stage = self._profile_current_stage
+        self._profile_current_stage = name
+        if use_cuda_timer:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        else:
+            start = time.perf_counter()
+        try:
+            yield
+        finally:
+            if use_cuda_timer:
+                end_event.record()
+                torch.cuda.synchronize(device)
+                elapsed_ms = float(start_event.elapsed_time(end_event))
+            else:
+                elapsed_ms = (time.perf_counter() - start) * 1000.0
+            timing = self._inference_profile.setdefault("timing_ms", {})
+            timing[name] = timing.get(name, 0.0) + elapsed_ms
+            self._profile_current_stage = previous_stage
+
+    def _begin_inference_profile(self):
+        self._inference_profile = {"timing_ms": {}}
+        self._profile_current_stage = None
+
+    def _end_inference_profile(self):
+        profile = self._inference_profile
+        self._inference_profile = None
+        self._profile_current_stage = None
+        return profile
 
     def _freeze_ema(self):
         for module in [self.ema_backbone, self.ema_visual_fusion, self.ema_projector]:
@@ -528,28 +653,30 @@ class DETRVAE(nn.Module):
         return torch.cat([special, pooled], dim=0)  # (2 + rq_num_tokens, B, H)
 
     def _quantize_memory(self, memory, feat_h, feat_w, num_active_stages=None):
-        """2D-pool visual tokens, add positional encoding, project, and RQ-quantize.
+        """2D-pool visual tokens, add positional encoding, project, and quantize.
 
         Returns rq_memory (2+rq_num_tokens, B, hidden_dim) and vq_outputs dict.
         """
-        pooled = self._pool_visual_tokens(memory, feat_h, feat_w)  # (2+rq_num_tokens, B, H)
-        # Add learned positional encoding so the quantizer and future decoder know token positions
-        pos_idx = torch.arange(pooled.shape[0], device=memory.device)
-        pooled = pooled + self.rq_pos_embed(pos_idx).unsqueeze(1)
-        code_input = self.memory_to_code(pooled)  # (2+rq_num_tokens, B, D=codebook_dim)
-        rq_result = self.memory_quantizer(code_input, num_active_stages=num_active_stages)
-        rq_memory = self.code_to_memory(rq_result["quantized"])  # (2+rq_num_tokens, B, H)
+        with self._profile_section("quantization", memory.device):
+            pooled = self._pool_visual_tokens(memory, feat_h, feat_w)  # (2+rq_num_tokens, B, H)
+            # Add learned positional encoding so the quantizer and future decoder know token positions
+            pos_idx = torch.arange(pooled.shape[0], device=memory.device)
+            pooled = pooled + self.rq_pos_embed(pos_idx).unsqueeze(1)
+            code_input = self.memory_to_code(pooled)  # (2+rq_num_tokens, B, D=codebook_dim)
+            vq_result = self.memory_quantizer(code_input, num_active_stages=num_active_stages)
+        with self._profile_section("dequantization", memory.device):
+            rq_memory = self.code_to_memory(vq_result["quantized"])  # (2+rq_num_tokens, B, H)
         vq_outputs = {
-            "codes": rq_result["codes"],
-            "codebook_loss": rq_result["codebook_loss"],
-            "commitment_loss": rq_result["commitment_loss"],
-            "perplexity": rq_result["perplexity"],
-            "stage_perplexities": rq_result["stage_perplexities"],
+            "codes": vq_result["codes"],
+            "codebook_loss": vq_result["codebook_loss"],
+            "commitment_loss": vq_result["commitment_loss"],
+            "perplexity": vq_result["perplexity"],
+            "stage_perplexities": vq_result["stage_perplexities"],
         }
         return rq_memory, vq_outputs
 
     def _decode_memory_codes(self, codes):
-        """Decode RQ codes back to rq_memory. codes: (rq_num_tokens+2, B, num_stages)."""
+        """Decode quantizer codes back to rq_memory."""
         code_vectors = self.memory_quantizer.decode(codes)  # (32, B, codebook_dim)
         return self.code_to_memory(code_vectors)  # (32, B, hidden_dim)
 
@@ -572,27 +699,28 @@ class DETRVAE(nn.Module):
 
     def _encode_visual_tokens(self, qpos, image, latent_input, use_quantized_memory=True, num_active_rq_stages=None):
         bs, _, _, _, _ = image.shape
-        all_cam_features = []
-        all_cam_pos = []
-        feat_h = feat_w = None
-        for cam_id, _ in enumerate(self.camera_names):
-            features, pos = self.backbones[cam_id](image[:, cam_id])
-            features = self.visual_fusion(features)
-            pos = pos[-1]
-            feat_h, feat_w = features.shape[-2:]
-            all_cam_features.append(features)
-            all_cam_pos.append(pos)
+        with self._profile_section("encoder", image.device):
+            all_cam_features = []
+            all_cam_pos = []
+            feat_h = feat_w = None
+            for cam_id, _ in enumerate(self.camera_names):
+                features, pos = self.backbones[cam_id](image[:, cam_id])
+                features = self.visual_fusion(features)
+                pos = pos[-1]
+                feat_h, feat_w = features.shape[-2:]
+                all_cam_features.append(features)
+                all_cam_pos.append(pos)
 
-        proprio_input = self.input_proj_robot_state(qpos)
-        src = torch.cat(all_cam_features, axis=3)
-        pos = torch.cat(all_cam_pos, axis=3)
-        src_flat = src.flatten(2).permute(2, 0, 1)
-        pos_flat = pos.flatten(2).permute(2, 0, 1).repeat(1, bs, 1)
-        additional_pos_embed = self.additional_pos_embed.weight.unsqueeze(1).repeat(1, bs, 1)
-        pos_full = torch.cat([additional_pos_embed, pos_flat], axis=0)
-        src_full = torch.cat([torch.stack([latent_input, proprio_input], axis=0), src_flat], axis=0)
+            proprio_input = self.input_proj_robot_state(qpos)
+            src = torch.cat(all_cam_features, axis=3)
+            pos = torch.cat(all_cam_pos, axis=3)
+            src_flat = src.flatten(2).permute(2, 0, 1)
+            pos_flat = pos.flatten(2).permute(2, 0, 1).repeat(1, bs, 1)
+            additional_pos_embed = self.additional_pos_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+            pos_full = torch.cat([additional_pos_embed, pos_flat], axis=0)
+            src_full = torch.cat([torch.stack([latent_input, proprio_input], axis=0), src_flat], axis=0)
 
-        memory = self.transformer.encoder(src_full, src_key_padding_mask=None, pos=pos_full)
+            memory = self.transformer.encoder(src_full, src_key_padding_mask=None, pos=pos_full)
 
         # When quantized: both action decoder and future/comm branch use the shared quantized
         # payload P. When not quantized, action decoding keeps full encoder memory while
@@ -602,13 +730,15 @@ class DETRVAE(nn.Module):
                 memory, feat_h, feat_w, num_active_stages=num_active_rq_stages
             )
             rq_pos = self._rq_pos_for_decode(rq_memory.shape[0], bs, memory.device)
-            hs, attn_weights = self._decode_from_memory(rq_memory, pos=rq_pos)
+            with self._profile_section("action_decoding", memory.device):
+                hs, attn_weights = self._decode_from_memory(rq_memory, pos=rq_pos)
         else:
             rq_memory = self._pool_visual_tokens(memory, feat_h, feat_w)
             pos_idx = torch.arange(rq_memory.shape[0], device=memory.device)
             rq_memory = rq_memory + self.rq_pos_embed(pos_idx).unsqueeze(1)
             vq_outputs = self._empty_vq_outputs(memory)
-            hs, attn_weights = self._decode_from_memory(memory, pos=pos_full)
+            with self._profile_section("action_decoding", memory.device):
+                hs, attn_weights = self._decode_from_memory(memory, pos=pos_full)
 
         return hs, attn_weights, rq_memory, vq_outputs, pos_full, feat_h, feat_w
 
@@ -812,6 +942,9 @@ class DETRVAE(nn.Module):
         num_active_rq_stages=None,
     ):
         is_training = actions is not None and not force_zero_latent
+        profiling = not is_training
+        if profiling:
+            self._begin_inference_profile()
         bs, _ = qpos.shape
 
         if is_training:
@@ -838,9 +971,10 @@ class DETRVAE(nn.Module):
             feat_h = feat_w = None
             vq_outputs = self._empty_vq_outputs(qpos)
 
-        hs = hs[-1]
-        a_hat = self.action_head(hs)
-        is_pad_hat = self.is_pad_head(hs)
+        with self._profile_section("action_decoding", qpos.device):
+            hs = hs[-1]
+            a_hat = self.action_head(hs)
+            is_pad_hat = self.is_pad_head(hs)
 
         comm_outputs = self._empty_comm_outputs(qpos)
         comm_outputs.update(
@@ -861,18 +995,21 @@ class DETRVAE(nn.Module):
 
         if run_future and rq_memory is not None and feat_h is not None and feat_w is not None:
             action_condition = a_hat if future_actions is None else future_actions
-            future_rgb_hat, future_z_hat = self._run_future_branch(
-                rq_memory,
-                feat_h,
-                feat_w,
-                action_condition,
-                detach_actions=detach_future_actions,
-            )
+            with self._profile_section("image_decoding", qpos.device):
+                future_rgb_hat, future_z_hat = self._run_future_branch(
+                    rq_memory,
+                    feat_h,
+                    feat_w,
+                    action_condition,
+                    detach_actions=detach_future_actions,
+                )
             comm_outputs["future_rgb_hat"] = future_rgb_hat
             comm_outputs["future_z_hat"] = future_z_hat
             if encode_target_semantics and future_images is not None:
                 comm_outputs["future_z_target"] = self._encode_ema_future_targets(future_images)
 
+        if profiling:
+            comm_outputs["inference_profile"] = self._end_inference_profile()
         return a_hat, is_pad_hat, [mu, logvar], attn_weights, comm_outputs
 
     def _empty_comm_outputs(self, reference):
@@ -889,6 +1026,7 @@ class DETRVAE(nn.Module):
             "vq_commitment_loss": scalar,
             "vq_perplexity": scalar,
             "vq_stage_perplexities": None,
+            "inference_profile": None,
         }
 
 
@@ -982,6 +1120,9 @@ def build(args):
         rq_num_tokens=getattr(args, "rq_num_tokens", 30),
         rq_num_stages=getattr(args, "rq_num_stages", 4),
         rq_codebook_bins=getattr(args, "rq_codebook_bins", 512),
+        quantizer_type=getattr(args, "quantizer_type", "rq"),
+        split_vq_num_codebooks=getattr(args, "split_vq_num_codebooks", 8),
+        split_vq_codebook_bins=getattr(args, "split_vq_codebook_bins", 512),
     )
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("number of parameters: %.2fM" % (n_parameters / 1e6,))

@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=variantC-vq-future
-#SBATCH --output=slurm_variant_c_vq_future_%j.out
-#SBATCH --error=slurm_variant_c_vq_future_%j.err
+#SBATCH --job-name=variantC-rq-D512
+#SBATCH --output=slurm_variant_c_rq_D512_%j.out
+#SBATCH --error=slurm_variant_c_rq_D512_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -25,19 +25,19 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 TASK_NAME="sim_transfer_cube_scripted"
 TARGET_CAMERA="top"
-# RQ parameters: N=30 pooled tokens, D=128 codebook dim, M=4 stages, K=512 codes/stage
+CODEBOOK_TYPE="rq"
 RQ_TOKENS=30
 RQ_STAGES=4
 RQ_CODEBOOK_BINS=512
-CODEBOOK_DIM=128
-CKPT_DIR="./checkpoints/checkpoints_variant_c_${TASK_NAME}_${TARGET_CAMERA}_rq_N${RQ_TOKENS}_M${RQ_STAGES}_K${RQ_CODEBOOK_BINS}_D${CODEBOOK_DIM}_2_three_stage"
+CODEBOOK_DIM=512
+CKPT_DIR="./checkpoints/checkpoints_variant_c_${TASK_NAME}_${TARGET_CAMERA}_${CODEBOOK_TYPE}_N${RQ_TOKENS}_M${RQ_STAGES}_K${RQ_CODEBOOK_BINS}_D${CODEBOOK_DIM}_hierarchy_three_stage"
 # Set to a *_training.ckpt path to resume; leave empty to start fresh
 RESUME_CKPT=""
 
 mkdir -p "${CKPT_DIR}"
 echo "Checkpoint dir: ${CKPT_DIR}"
 echo "Task: ${TASK_NAME}, target camera: ${TARGET_CAMERA}"
-echo "RQ enabled: true"
+echo "Quantizer: ${CODEBOOK_TYPE}"
 echo "RQ: tokens=${RQ_TOKENS}, stages=${RQ_STAGES}, codebook_bins=${RQ_CODEBOOK_BINS}, codebook_dim=${CODEBOOK_DIM}"
 nvidia-smi
 
@@ -68,7 +68,7 @@ python -u imitate_episodes_variant_c.py \
     --future_teacher_mix_steps 8000 \
     --future_rgb_decay_alpha 0.03 \
     --future_latent_decay_alpha 0.01 \
-    --quantizer_type rq \
+    --quantizer_type "${CODEBOOK_TYPE}" \
     --codebook_dim "${CODEBOOK_DIM}" \
     --lambda_vq 1.0 \
     --lambda_vq_commit 0.25 \

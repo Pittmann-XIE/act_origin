@@ -119,7 +119,49 @@ Multi-stage training notes (Variant C):
 """
 
 
+def normalize_quantizer_args(args):
+    quantizer_cli_provided = args.get("quantizer_type") is not None
+    quantizer_type = args.get("quantizer_type")
+    using_rq = bool(args.get("using_RQ", False))
+    if quantizer_type is None:
+        quantizer_type = "rq" if using_rq else "none"
+    elif using_rq and quantizer_type != "rq":
+        raise ValueError("--using_RQ is a backward-compatible alias for --quantizer_type rq; "
+                         "do not combine it with another quantizer_type.")
+    if quantizer_type not in {"none", "rq", "split_vq"}:
+        raise ValueError(f"Unknown quantizer_type {quantizer_type!r}; expected none, rq, or split_vq.")
+    if quantizer_type == "split_vq":
+        codebook_dim = int(args["codebook_dim"])
+        num_codebooks = int(args["split_vq_num_codebooks"])
+        if num_codebooks <= 0:
+            raise ValueError(f"--split_vq_num_codebooks must be positive, got {num_codebooks}")
+        if codebook_dim % num_codebooks != 0:
+            raise ValueError(
+                f"--codebook_dim {codebook_dim} must be divisible by "
+                f"--split_vq_num_codebooks {num_codebooks}"
+            )
+    args["quantizer_type"] = quantizer_type
+    args["_quantizer_type_cli_provided"] = quantizer_cli_provided
+    args["using_RQ"] = quantizer_type == "rq"
+
+
+def validate_eval_rq_active_stages(policy_config, active_stages):
+    if not active_stages:
+        return
+    quantizer_type = policy_config.get("quantizer_type", "rq" if policy_config.get("using_RQ", False) else "none")
+    if quantizer_type != "rq":
+        raise ValueError("--eval_rq_active_stages is only valid when quantizer_type is rq.")
+    max_stages = int(policy_config.get("rq_num_stages", 4))
+    for stage_count in active_stages:
+        stage_count = int(stage_count)
+        if stage_count < 1 or stage_count > max_stages:
+            raise ValueError(
+                f"Invalid eval RQ active stage count {stage_count}; expected 1..{max_stages}."
+            )
+
+
 def main(args):
+    normalize_quantizer_args(args)
     set_seed(1)
     is_eval = args["eval"]
     ckpt_dir = args["ckpt_dir"]
@@ -197,6 +239,7 @@ def main(args):
             "future_rgb_decay_alpha": args["future_rgb_decay_alpha"],
             "future_latent_decay_alpha": args["future_latent_decay_alpha"],
             "future_teacher_mix_steps": args["future_teacher_mix_steps"],
+            "quantizer_type": args["quantizer_type"],
             "using_RQ": args["using_RQ"],
             "codebook_bins": args["codebook_bins"],
             "codebook_dim": args["codebook_dim"],
@@ -206,6 +249,8 @@ def main(args):
             "rq_num_tokens": args["rq_num_tokens"],
             "rq_num_stages": args["rq_num_stages"],
             "rq_codebook_bins": args["rq_codebook_bins"],
+            "split_vq_num_codebooks": args["split_vq_num_codebooks"],
+            "split_vq_codebook_bins": args["split_vq_codebook_bins"],
             "rq_dropout_probs": args["rq_dropout_probs"],
             "rq_dead_code_restart_interval": args["rq_dead_code_restart_interval"],
             "rq_dead_code_restart_threshold": args["rq_dead_code_restart_threshold"],
@@ -244,6 +289,7 @@ def main(args):
         "stage1_epochs": args.get("stage1_epochs"),
         "stage2_epochs": args.get("stage2_epochs"),
         "stage3_epochs": args.get("stage3_epochs"),
+        "eval_rq_active_stages": args.get("eval_rq_active_stages"),
     }
 
     if args.get("export_netron_onnx"):
@@ -252,10 +298,20 @@ def main(args):
 
     if is_eval:
         config = load_eval_config_from_training_snapshot(config, args)
+        validate_eval_rq_active_stages(config["policy_config"], config.get("eval_rq_active_stages"))
         results = []
-        for ckpt_name in ["policy_best.ckpt"]:
-            success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
-            results.append([ckpt_name, success_rate, avg_return])
+        rq_eval_stages = config.get("eval_rq_active_stages") or [None]
+        for active_stages in rq_eval_stages:
+            eval_config = deepcopy(config)
+            ckpt_label = "policy_best.ckpt"
+            if active_stages is not None:
+                eval_config["policy_config"] = deepcopy(config["policy_config"])
+                eval_config["policy_config"]["eval_num_active_rq_stages"] = int(active_stages)
+                eval_config["eval_result_suffix"] = f"_rq{int(active_stages)}stages"
+                ckpt_label = f"policy_best.ckpt@rq{int(active_stages)}stages"
+            for ckpt_name in ["policy_best.ckpt"]:
+                success_rate, avg_return = eval_bc(eval_config, ckpt_name, save_episode=True)
+                results.append([ckpt_label, success_rate, avg_return])
         for ckpt_name, success_rate, avg_return in results:
             print(f"{ckpt_name}: {success_rate=} {avg_return=}")
         return
@@ -395,6 +451,7 @@ def load_eval_config_from_training_snapshot(config, args):
     eval_config["onscreen_render"] = args["onscreen_render"]
     eval_config["temporal_agg"] = args["temporal_agg"]
     eval_config["resume_ckpt"] = args.get("resume_ckpt")
+    eval_config["eval_rq_active_stages"] = args.get("eval_rq_active_stages")
 
     policy_config = eval_config.get("policy_config")
     if not isinstance(policy_config, dict):
@@ -403,7 +460,13 @@ def load_eval_config_from_training_snapshot(config, args):
         "rq_dead_code_restart_max_fraction",
         args.get("rq_dead_code_restart_max_fraction", 0.05),
     )
-    policy_config["using_RQ"] = args["using_RQ"]
+    policy_config.setdefault("quantizer_type", "rq" if policy_config.get("using_RQ", False) else "none")
+    policy_config.setdefault("split_vq_num_codebooks", args.get("split_vq_num_codebooks", 8))
+    policy_config.setdefault("split_vq_codebook_bins", args.get("split_vq_codebook_bins", 512))
+    if args.get("_quantizer_type_cli_provided", False) or args.get("using_RQ", False):
+        policy_config["quantizer_type"] = args["quantizer_type"]
+        policy_config["using_RQ"] = args["quantizer_type"] == "rq"
+    validate_eval_rq_active_stages(policy_config, eval_config.get("eval_rq_active_stages"))
 
     print(f"Loaded eval model config from {config_path}")
     return eval_config
@@ -842,6 +905,146 @@ def summarize_metric_sums(metric_sums, metric_count):
     return {key: value / metric_count for key, value in sorted(metric_sums.items())}
 
 
+def quantization_payload_metrics(policy_config, policy):
+    """Compute communication payload size and compression ratio in bits.
+
+    The unquantized baseline is the 32-token pooled hidden-memory payload sent as
+    fp32 values. For quantized variants, the transmitted payload is code indices.
+    """
+    quantizer_type = policy_config.get("quantizer_type", "rq" if policy_config.get("using_RQ", False) else "none")
+    num_tokens = int(policy_config.get("rq_num_tokens", 30)) + 2
+    hidden_dim = int(getattr(policy.model, "hidden_dim", policy_config.get("hidden_dim", 512)))
+    float_bits = 32
+    unquantized_bits = num_tokens * hidden_dim * float_bits
+
+    if quantizer_type == "none":
+        payload_bits = unquantized_bits
+        num_codebooks = 0
+        codebook_bins = 0
+        bits_per_index = 0
+    elif quantizer_type == "rq":
+        num_codebooks = int(policy_config.get("eval_num_active_rq_stages") or policy_config.get("rq_num_stages", 4))
+        codebook_bins = int(policy_config.get("rq_codebook_bins", 512))
+        bits_per_index = int(np.ceil(np.log2(codebook_bins)))
+        payload_bits = num_tokens * num_codebooks * bits_per_index
+    elif quantizer_type == "split_vq":
+        num_codebooks = int(policy_config.get("split_vq_num_codebooks", 8))
+        codebook_bins = int(policy_config.get("split_vq_codebook_bins", 512))
+        bits_per_index = int(np.ceil(np.log2(codebook_bins)))
+        payload_bits = num_tokens * num_codebooks * bits_per_index
+    else:
+        raise ValueError(f"Unknown quantizer_type {quantizer_type!r}")
+
+    compression_ratio = 1.0 if quantizer_type == "none" else unquantized_bits / max(payload_bits, 1)
+    return {
+        "quantizer_type": quantizer_type,
+        "payload_num_tokens": num_tokens,
+        "payload_hidden_dim": hidden_dim,
+        "payload_float_bits": float_bits,
+        "payload_num_codebooks": num_codebooks,
+        "eval_num_active_rq_stages": int(policy_config.get("eval_num_active_rq_stages") or 0),
+        "payload_codebook_bins": codebook_bins,
+        "payload_bits_per_index": bits_per_index,
+        "unquantized_payload_bits_per_frame": unquantized_bits,
+        "quantized_payload_bits_per_frame": payload_bits,
+        "compression_ratio": compression_ratio,
+    }
+
+
+class InferenceFlopCounter:
+    """Lightweight estimated FLOP counter grouped by model inference profile stage."""
+
+    def __init__(self, model):
+        self.model = model
+        self.flops_by_stage = {}
+        self.handles = []
+
+    def install(self):
+        for module in self.model.modules():
+            if isinstance(module, nn.Linear):
+                self.handles.append(module.register_forward_hook(self._linear_hook))
+            elif isinstance(module, nn.Conv2d):
+                self.handles.append(module.register_forward_hook(self._conv2d_hook))
+            elif isinstance(module, nn.ConvTranspose2d):
+                self.handles.append(module.register_forward_hook(self._conv_transpose2d_hook))
+
+    def remove(self):
+        for handle in self.handles:
+            handle.remove()
+        self.handles = []
+
+    def _stage(self):
+        return getattr(self.model, "_profile_current_stage", None)
+
+    def _add(self, flops):
+        stage = self._stage()
+        if stage is None:
+            return
+        self.flops_by_stage[stage] = self.flops_by_stage.get(stage, 0.0) + float(flops)
+
+    def _linear_hook(self, module, inputs, output):
+        if self._stage() is None:
+            return
+        tensor_out = output[0] if isinstance(output, tuple) else output
+        if not torch.is_tensor(tensor_out):
+            return
+        self._add(2.0 * tensor_out.numel() * module.in_features)
+
+    def _conv2d_hook(self, module, inputs, output):
+        if self._stage() is None or not torch.is_tensor(output):
+            return
+        batch, out_channels, out_h, out_w = output.shape
+        kernel_h, kernel_w = module.kernel_size
+        conv_per_position = (module.in_channels / module.groups) * kernel_h * kernel_w
+        self._add(2.0 * batch * out_channels * out_h * out_w * conv_per_position)
+
+    def _conv_transpose2d_hook(self, module, inputs, output):
+        if self._stage() is None or not torch.is_tensor(output):
+            return
+        batch, out_channels, out_h, out_w = output.shape
+        kernel_h, kernel_w = module.kernel_size
+        conv_per_position = (module.in_channels / module.groups) * kernel_h * kernel_w
+        self._add(2.0 * batch * out_channels * out_h * out_w * conv_per_position)
+
+
+def add_inference_profile_sample(timing_sums, profile):
+    timing = (profile or {}).get("timing_ms") or {}
+    if not timing:
+        return False
+    total_ms = 0.0
+    for key, value in timing.items():
+        value = float(value)
+        timing_sums[key] = timing_sums.get(key, 0.0) + value
+        total_ms += value
+    timing_sums["total_profiled_inference"] = timing_sums.get("total_profiled_inference", 0.0) + total_ms
+    return True
+
+
+def inference_resource_metrics(timing_sums, profile_count, flop_counter):
+    if profile_count <= 0:
+        return {}
+    metrics = {"profiled_inference_calls": profile_count}
+    avg_timing = {key: value / profile_count for key, value in sorted(timing_sums.items())}
+    for key, value in avg_timing.items():
+        metrics[f"{key}_ms"] = value
+
+    total_flops = 0.0
+    for stage, total_stage_flops in sorted(flop_counter.flops_by_stage.items()):
+        flops_per_call = total_stage_flops / profile_count
+        total_flops += flops_per_call
+        metrics[f"estimated_{stage}_flops_per_inference"] = flops_per_call
+        metrics[f"estimated_{stage}_gflops_per_inference"] = flops_per_call / 1e9
+        stage_ms = avg_timing.get(stage)
+        if stage_ms and stage_ms > 0:
+            metrics[f"estimated_{stage}_gflops_per_second"] = (flops_per_call / 1e9) / (stage_ms / 1000.0)
+    metrics["estimated_total_flops_per_inference"] = total_flops
+    metrics["estimated_total_gflops_per_inference"] = total_flops / 1e9
+    total_ms = avg_timing.get("total_profiled_inference")
+    if total_ms and total_ms > 0:
+        metrics["estimated_total_gflops_per_second"] = (total_flops / 1e9) / (total_ms / 1000.0)
+    return metrics
+
+
 def sample_non_colliding_pose(existing_poses, min_dist=0.06, max_tries=100):
     for _ in range(max_tries):
         pose = sample_box_pose()
@@ -868,6 +1071,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     task_name = config["task_name"]
     temporal_agg = config["temporal_agg"]
     device = config["device"]
+    result_suffix = config.get("eval_result_suffix", "")
     onscreen_cam = "angle"
     target_camera = policy_config.get("target_camera", camera_names[0])
     future_horizons = policy_config.get("future_horizons", [0, 5, 15, 30, 60, 99])
@@ -885,6 +1089,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
     print(loading_status)
     policy.to(device_obj)
     policy.eval()
+    payload_metrics = quantization_payload_metrics(policy_config, policy)
+    flop_counter = InferenceFlopCounter(policy.model)
+    flop_counter.install()
 
     with open(os.path.join(ckpt_dir, "dataset_stats.pkl"), "rb") as file_obj:
         stats = pickle.load(file_obj)
@@ -913,6 +1120,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
     highest_rewards = []
     eval_metric_sums = {}
     eval_metric_count = 0
+    inference_timing_sums = {}
+    inference_profile_count = 0
     future_image_height = int(policy_config.get("future_image_height", 240))
     future_image_width = int(policy_config.get("future_image_width", 320))
     roi_background_weight = float(policy_config.get("roi_background_weight", 1.0))
@@ -970,6 +1179,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 if config["policy_class"] == "ACT":
                     if t % query_frequency == 0:
                         all_actions, _, comm_outputs = policy(qpos, curr_image, return_comm=True)
+                        if add_inference_profile_sample(
+                            inference_timing_sums,
+                            comm_outputs.get("inference_profile"),
+                        ):
+                            inference_profile_count += 1
                         future_rgb_hat = comm_outputs.get("future_rgb_hat")
                         if future_rgb_hat is not None:
                             pred_future = tensor_to_uint8_frames(future_rgb_hat)
@@ -1076,16 +1290,31 @@ def eval_bc(config, ckpt_name, save_episode=True):
             )
 
         if save_episode:
-            save_eval_video(eval_frames, DT, video_path=os.path.join(ckpt_dir, f"video{rollout_id}.mp4"))
+            save_eval_video(eval_frames, DT, video_path=os.path.join(ckpt_dir, f"video{result_suffix}{rollout_id}.mp4"))
 
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
+    flop_counter.remove()
     eval_metrics = summarize_metric_sums(eval_metric_sums, eval_metric_count)
+    resource_metrics = inference_resource_metrics(
+        inference_timing_sums,
+        inference_profile_count,
+        flop_counter,
+    )
     summary_str = f"\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n"
     for reward in range(env_max_reward + 1):
         more_or_equal_r = (np.array(highest_rewards) >= reward).sum()
         more_or_equal_r_rate = more_or_equal_r / num_rollouts
         summary_str += f"Reward >= {reward}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n"
+    summary_str += "\nCommunication payload metrics:\n"
+    for key, value in payload_metrics.items():
+        summary_str += f"{key}: {value}\n"
+    if resource_metrics:
+        summary_str += "\nInference resource metrics:\n"
+        summary_str += "Timing values are averaged per policy query and reported in ms.\n"
+        summary_str += "FLOPs are estimated from Linear/Conv layers inside profiled stages.\n"
+        for key, value in resource_metrics.items():
+            summary_str += f"{key}: {value}\n"
     if eval_metrics:
         summary_str += "\nImage prediction metrics:\n"
         summary_str += (
@@ -1099,7 +1328,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 summary_str += f"{key}: {value}\n"
 
     print(summary_str)
-    result_file_name = "result_" + ckpt_name.split(".")[0] + ".txt"
+    result_file_name = "result_" + ckpt_name.split(".")[0] + f"{result_suffix}.txt"
     with open(os.path.join(ckpt_dir, result_file_name), "w", encoding="utf-8") as file_obj:
         file_obj.write(summary_str)
         file_obj.write(repr(episode_returns))
@@ -1540,23 +1769,24 @@ def train_bc_three_stage(train_dataloader, val_dataloader, config):
 
 
 def init_codebook_kmeans(policy, train_dataloader, device, n_batches=200, n_iter=50):
-    """Initialize the RQ codebook via cascaded k-means on training-set encoder outputs.
+    """Initialize the active quantizer via k-means on training-set encoder outputs.
 
     Collects pre-quantization vectors from `n_batches` training batches (pooled +
-    projected, shape [B*32, D=128]), then runs cascaded GPU k-means and sets the
-    per-stage codebook weights. Only runs if the policy model exposes a
+    projected, shape [B*32, D=codebook_dim]), then runs quantizer-specific
+    k-means and sets codebook weights. Only runs if the policy model exposes a
     `memory_quantizer` attribute.
     """
-    if not getattr(policy, "using_RQ", False):
-        print("Skipping RQ cascaded k-means init because using_RQ is disabled.")
+    if getattr(policy, "quantizer_type", "none") == "none":
+        print("Skipping quantizer k-means init because quantizer_type is none.")
         return
     if not hasattr(policy.model, "memory_quantizer"):
         return
-    rq = policy.model.memory_quantizer
-    k = rq.codebook_bins
+    quantizer = policy.model.memory_quantizer
+    k = quantizer.codebook_bins
+    num_codebooks = getattr(quantizer, "num_codebooks", getattr(quantizer, "num_stages", 1))
     print(
-        f"\nRQ cascaded k-means init: collecting from {n_batches} batches "
-        f"(k={k}, D={rq.codebook_dim}, stages={rq.num_stages})..."
+        f"\n{policy.quantizer_type} k-means init: collecting from {n_batches} batches "
+        f"(k={k}, D={quantizer.codebook_dim}, codebooks={num_codebooks})..."
     )
 
     policy.eval()
@@ -1572,8 +1802,8 @@ def init_codebook_kmeans(policy, train_dataloader, device, n_batches=200, n_iter
 
     all_vectors = torch.cat(all_vectors, dim=0)
     print(f"  Collected {all_vectors.shape[0]} vectors of dim {all_vectors.shape[1]}")
-    rq.init_from_data(all_vectors, n_iter=n_iter)
-    # RQ loss active from stage 2 epoch 0 — k-means init replaces warmup protection
+    quantizer.init_from_data(all_vectors, n_iter=n_iter)
+    # VQ loss active from stage 2 epoch 0 — k-means init replaces warmup protection
     policy.vq_warmup_epochs = 0
     policy.train()
 
@@ -1642,8 +1872,10 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_future_rgb", action="store", type=float, default=1.0)
     parser.add_argument("--lambda_future_grad", action="store", type=float, default=0.25)
     parser.add_argument("--lambda_future_latent", action="store", type=float, default=0.1)
+    parser.add_argument("--quantizer_type", action="store", choices=["none", "rq", "split_vq"], default=None,
+                        help="Quantizer to use for compressed memory. Defaults to none unless --using_RQ is set.")
     parser.add_argument("--using_RQ", action="store_true",
-                        help="Enable residual quantization and its VQ losses. Disabled by default.")
+                        help="Backward-compatible alias for --quantizer_type rq.")
     parser.add_argument("--codebook_bins", action="store", type=int, default=512)
     parser.add_argument("--codebook_dim", action="store", type=int, default=128)
     parser.add_argument("--lambda_vq", action="store", type=float, default=1.0)
@@ -1652,6 +1884,10 @@ if __name__ == "__main__":
     parser.add_argument("--rq_num_tokens", action="store", type=int, default=30)
     parser.add_argument("--rq_num_stages", action="store", type=int, default=4)
     parser.add_argument("--rq_codebook_bins", action="store", type=int, default=512)
+    parser.add_argument("--eval_rq_active_stages", action="store", type=int, nargs="+", default=None,
+                        help="Eval-only RQ sweep. Example: --eval_rq_active_stages 1 2 3 4")
+    parser.add_argument("--split_vq_num_codebooks", action="store", type=int, default=8)
+    parser.add_argument("--split_vq_codebook_bins", action="store", type=int, default=512)
     parser.add_argument("--rq_dropout_probs", action="store", type=float, nargs="+",
                         default=[0.50, 0.25, 0.15, 0.10])
     parser.add_argument("--rq_dead_code_restart_interval", action="store", type=int, default=500)

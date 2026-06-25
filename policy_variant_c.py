@@ -61,7 +61,13 @@ class ACTPolicy(nn.Module):
         self.lambda_future_rgb = args_override.get("lambda_future_rgb", 1.0)
         self.lambda_future_grad = args_override.get("lambda_future_grad", 0.25)
         self.lambda_future_latent = args_override.get("lambda_future_latent", 0.1)
-        self.using_RQ = bool(args_override.get("using_RQ", False))
+        self.quantizer_type = args_override.get("quantizer_type")
+        if self.quantizer_type is None:
+            self.quantizer_type = "rq" if bool(args_override.get("using_RQ", False)) else "none"
+        self.using_RQ = self.quantizer_type == "rq"
+        self.eval_num_active_rq_stages = args_override.get("eval_num_active_rq_stages")
+        if self.eval_num_active_rq_stages is not None:
+            self.eval_num_active_rq_stages = int(self.eval_num_active_rq_stages)
         self.lambda_vq = args_override.get("lambda_vq", 1.0)
         self.lambda_vq_commit = args_override.get("lambda_vq_commit", 0.25)
         self.vq_warmup_epochs = int(args_override.get("vq_warmup_epochs", 0))
@@ -88,7 +94,7 @@ class ACTPolicy(nn.Module):
             f"KL Weight {self.kl_weight}, lambda_roi {self.lambda_roi}, "
             f"lambda_sem {self.lambda_sem}, lambda_sig {self.lambda_sig}, "
             f"lambda_recon_grad {self.lambda_recon_grad}, "
-            f"focus_masked_region {self.focus_masked_region}, using_RQ {self.using_RQ}, "
+            f"focus_masked_region {self.focus_masked_region}, quantizer_type {self.quantizer_type}, "
             f"lambda_vq {self.lambda_vq}, lambda_vq_commit {self.lambda_vq_commit}, "
             f"vq_warmup_epochs {self.vq_warmup_epochs}"
         )
@@ -166,10 +172,12 @@ class ACTPolicy(nn.Module):
         return self._ema_updates < int(warmup)
 
     def _use_quantized_memory(self):
-        return self.using_RQ and self.current_epoch >= self.vq_warmup_epochs
+        return self.quantizer_type != "none" and self.current_epoch >= self.vq_warmup_epochs
 
-    def _sample_rq_active_stages(self):
+    def _sample_active_quantizer_codebooks(self):
         """Sample how many RQ stages to use during training (biased toward more stages)."""
+        if self.quantizer_type != "rq":
+            return None
         if not self.training:
             return self.model.memory_quantizer.num_stages
         r = random.random()
@@ -180,37 +188,45 @@ class ACTPolicy(nn.Module):
                 return i + 1
         return len(self.rq_dropout_probs)
 
+    def _num_quantizer_codebooks(self):
+        quantizer = self.model.memory_quantizer
+        return int(getattr(quantizer, "num_codebooks", getattr(quantizer, "num_stages")))
+
     def _ensure_rq_usage_buffers(self, device):
         device = torch.device(device)
-        rq = self.model.memory_quantizer
+        quantizer = self.model.memory_quantizer
+        num_codebooks = self._num_quantizer_codebooks()
         needs_init = (
             self._rq_usage_counts is None
-            or len(self._rq_usage_counts) != rq.num_stages
-            or self._rq_usage_counts[0].numel() != rq.codebook_bins
+            or len(self._rq_usage_counts) != num_codebooks
+            or self._rq_usage_counts[0].numel() != quantizer.codebook_bins
             or self._rq_usage_counts[0].device != device
         )
         if needs_init:
             self._rq_usage_counts = [
-                torch.zeros(rq.codebook_bins, dtype=torch.float32, device=device)
-                for _ in range(rq.num_stages)
+                torch.zeros(quantizer.codebook_bins, dtype=torch.float32, device=device)
+                for _ in range(num_codebooks)
             ]
             self._rq_usage_totals = [
                 torch.zeros((), dtype=torch.float32, device=device)
-                for _ in range(rq.num_stages)
+                for _ in range(num_codebooks)
             ]
 
     @torch.no_grad()
-    def _accumulate_rq_usage(self, codes, num_active_stages):
-        if codes is None or num_active_stages is None:
+    def _accumulate_quantizer_usage(self, codes, num_active_codebooks=None):
+        if codes is None or self.quantizer_type == "none":
             return
-        rq = self.model.memory_quantizer
+        quantizer = self.model.memory_quantizer
         self._ensure_rq_usage_buffers(codes.device)
-        active = min(int(num_active_stages), rq.num_stages)
-        for stage_idx in range(active):
-            stage_codes = codes[..., stage_idx].reshape(-1)
-            counts = torch.bincount(stage_codes, minlength=rq.codebook_bins).to(torch.float32)
-            self._rq_usage_counts[stage_idx].add_(counts)
-            self._rq_usage_totals[stage_idx].add_(float(stage_codes.numel()))
+        if num_active_codebooks is None:
+            active = self._num_quantizer_codebooks()
+        else:
+            active = min(int(num_active_codebooks), self._num_quantizer_codebooks())
+        for codebook_idx in range(active):
+            codebook_codes = codes[..., codebook_idx].reshape(-1)
+            counts = torch.bincount(codebook_codes, minlength=quantizer.codebook_bins).to(torch.float32)
+            self._rq_usage_counts[codebook_idx].add_(counts)
+            self._rq_usage_totals[codebook_idx].add_(float(codebook_codes.numel()))
 
     def _reset_rq_usage_buffers(self):
         if self._rq_usage_counts is None or self._rq_usage_totals is None:
@@ -323,8 +339,8 @@ class ACTPolicy(nn.Module):
             future_image = normalize(future_rgb.flatten(0, 1)).reshape_as(future_rgb) if future_rgb is not None else None
             use_predicted_future_actions = self._use_predicted_future_actions()
             future_actions = None if use_predicted_future_actions else actions
-            use_rq = self._use_quantized_memory() and not is_act_stage
-            num_active_rq_stages = self._sample_rq_active_stages() if use_rq else None
+            use_quantizer = self._use_quantized_memory() and not is_act_stage
+            num_active_codebooks = self._sample_active_quantizer_codebooks() if use_quantizer else None
             a_hat, is_pad_hat, (mu, logvar), _, comm_outputs = self.model(
                 qpos,
                 image,
@@ -340,8 +356,8 @@ class ACTPolicy(nn.Module):
                 run_comm=False,
                 run_future=not is_act_stage and future_rgb is not None,
                 encode_target_semantics=not is_act_stage,
-                use_quantized_memory=use_rq,
-                num_active_rq_stages=num_active_rq_stages,
+                use_quantized_memory=use_quantizer,
+                num_active_rq_stages=num_active_codebooks,
             )
             loss_dict = dict()
             all_l1 = F.l1_loss(actions, a_hat, reduction="none")
@@ -443,11 +459,11 @@ class ACTPolicy(nn.Module):
             loss_dict["vq"] = comm_outputs["vq_loss"]
             loss_dict["vq_commit"] = comm_outputs["vq_commitment_loss"]
             loss_dict["vq_perplexity"] = comm_outputs["vq_perplexity"]
-            if self.training and use_rq:
-                self._accumulate_rq_usage(comm_outputs.get("vq_codes"), num_active_rq_stages)
-            loss_dict["rq_active_stages"] = torch.tensor(
-                float(num_active_rq_stages if num_active_rq_stages is not None else
-                      self.model.memory_quantizer.num_stages),
+            if self.training and use_quantizer:
+                self._accumulate_quantizer_usage(comm_outputs.get("vq_codes"), num_active_codebooks)
+            loss_dict["quantizer_active_codebooks"] = torch.tensor(
+                float(num_active_codebooks if num_active_codebooks is not None else
+                      (self._num_quantizer_codebooks() if self.quantizer_type != "none" else 0)),
                 device=qpos.device,
             )
             stage_perps = comm_outputs.get("vq_stage_perplexities")
@@ -455,7 +471,8 @@ class ACTPolicy(nn.Module):
                 for i, p in enumerate(stage_perps):
                     loss_dict[f"vq_perplexity_stage_{i + 1}"] = p
             else:
-                for i in range(self.model.memory_quantizer.num_stages):
+                num_metric_codebooks = self._num_quantizer_codebooks() if self.quantizer_type != "none" else 0
+                for i in range(num_metric_codebooks):
                     loss_dict[f"vq_perplexity_stage_{i + 1}"] = torch.zeros((), device=qpos.device)
             if is_act_stage:
                 loss_dict["loss"] = loss_dict["l1"] + loss_dict["kl"] * self.kl_weight
@@ -483,7 +500,7 @@ class ACTPolicy(nn.Module):
                     + loss_dict["future_grad"] * self.lambda_future_grad
                     + loss_dict["future_latent"] * self.lambda_future_latent
                 )
-            if use_rq:
+            if use_quantizer:
                 loss_dict["loss"] = (
                     loss_dict["loss"]
                     + loss_dict["vq"] * self.lambda_vq
@@ -502,6 +519,11 @@ class ACTPolicy(nn.Module):
             image,
             env_state,
             use_quantized_memory=self._use_quantized_memory(),
+            num_active_rq_stages=(
+                self.eval_num_active_rq_stages
+                if self.quantizer_type == "rq" and self._use_quantized_memory()
+                else None
+            ),
         )
         if return_comm:
             return a_hat, attn_weights, comm_outputs
@@ -518,7 +540,7 @@ class ACTPolicy(nn.Module):
 
     def should_restart_dead_codes(self):
         return (
-            self.using_RQ
+            self.quantizer_type != "none"
             and self.train_stage in {"future", "joint"}
             and self.rq_dead_restart_interval > 0
             and self._rq_steps > 0
@@ -527,8 +549,8 @@ class ACTPolicy(nn.Module):
 
     @torch.no_grad()
     def maybe_restart_dead_codes(self, image_data, qpos_data, device):
-        """Reinitialize codes with low usage over the accumulated RQ window."""
-        rq = self.model.memory_quantizer
+        """Reinitialize codes with low usage over the accumulated quantizer window."""
+        quantizer = self.model.memory_quantizer
         self._ensure_rq_usage_buffers(device)
         was_training = self.training
         self.eval()
@@ -537,10 +559,20 @@ class ACTPolicy(nn.Module):
         qpos_data = qpos_data.to(device)
         vectors = self.model.collect_code_inputs(image_data, qpos_data)  # (B*32, D)
 
-        # Compute per-stage residuals and restart dead codes
-        residual = vectors.clone()
-        for i, stage in enumerate(rq.stages):
-            flat = residual
+        if self.quantizer_type == "rq":
+            codebook_inputs = []
+            residual = vectors.clone()
+            codebooks = quantizer.stages
+        elif self.quantizer_type == "split_vq":
+            chunks = vectors.reshape(-1, quantizer.num_codebooks, quantizer.chunk_dim)
+            codebook_inputs = [chunks[:, i, :] for i in range(quantizer.num_codebooks)]
+            codebooks = quantizer.codebooks
+            residual = None
+        else:
+            return
+
+        for i, stage in enumerate(codebooks):
+            flat = residual if self.quantizer_type == "rq" else codebook_inputs[i]
             c_sq = stage.embedding.weight.pow(2).sum(dim=1)
             chunk = 4096
             assignments = torch.empty(flat.shape[0], dtype=torch.long, device=device)
@@ -551,9 +583,10 @@ class ACTPolicy(nn.Module):
 
             window_counts = self._rq_usage_counts[i]
             window_total = float(self._rq_usage_totals[i].item())
+            label = "RQ stage" if self.quantizer_type == "rq" else "Split-VQ codebook"
             if window_total <= 0:
                 active = int((window_counts > 0).sum())
-                print(f"  RQ stage {i + 1}: skipped dead-code restart; no accumulated assignments "
+                print(f"  {label} {i + 1}: skipped dead-code restart; no accumulated assignments "
                       f"(active_window: {active}/{stage.codebook_bins})")
             else:
                 expected = window_total / stage.codebook_bins
@@ -580,15 +613,15 @@ class ACTPolicy(nn.Module):
                     stage.embedding.weight.data[restart_indices] = flat[rand_idx]
                 active = int((window_counts > 0).sum())
                 print(
-                    f"  RQ stage {i + 1}: window_assignments={int(window_total)} "
+                    f"  {label} {i + 1}: window_assignments={int(window_total)} "
                     f"expected={expected:.2f} threshold={dead_threshold:.2f} "
                     f"dead={n_dead}/{stage.codebook_bins} restarted={n_restart} "
                     f"active_window={active}/{stage.codebook_bins}"
                 )
 
-            # Advance residual for next stage
-            quantized = stage.embedding(assignments)
-            residual = flat - quantized
+            if self.quantizer_type == "rq":
+                quantized = stage.embedding(assignments)
+                residual = flat - quantized
 
         self._reset_rq_usage_buffers()
         if was_training:
